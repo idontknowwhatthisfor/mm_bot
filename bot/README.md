@@ -47,6 +47,20 @@ bot.py ──► planner.py      which houses reach their colour, cheapest roads
   - Bridges and tunnels are straight crossings, drawn one tile at a time because each piece
     must exist before the next validates.
   - Any move the game refuses is avoided for a minute.
+  - Entering water takes a bridge from stock unless the first water tile already has road.
+    Only segments the map doesn't have yet are sent, because the game refuses an existing
+    bridge segment that is sent again (`CannotCreateBridge`).
+  - **Traffic:** the game routes every car along the shortest free-flow road and never around a
+    jam. Each road tile's load is the number of houses whose route uses it. Road carrying more
+    than 6 houses costs extra to drive along or join, and so does turning a road into a new
+    junction. Houses of a colour whose destination is close to overcrowding prefer to join that
+    destination's network.
+  - **Junction upgrades:** the busiest junctions get a roundabout (8+ houses), then a traffic
+    light (5+).
+  - **Bypasses:** a destination whose cars are slow to arrive gets a new road from its car park
+    to a far part of its network that houses actually use.
+  - Each day, and at game over, the log shows each active destination's pins (with and without
+    a car on the way), arrivals and overcrowd timer.
 - **Upkeep:**
   - Bridges or tunnels left with a missing piece get completed.
   - Dead-end roads, such as the stub left after a house turns, are cleared to recover their
@@ -86,6 +100,29 @@ python3 bot.py --start Tokyo
 `--maps` lists map names. `--keep-going` keeps the bot attached after a game ends, so it plays
 the next game you start.
 
+`--speed N` runs the game N times faster, for test runs:
+
+```bash
+python3 bot.py --start Tokyo --speed 4
+```
+
+The bot first times the game clock for 5 seconds at normal speed, then sets
+`MotorwaysGame._debugTimescale` (the multiplier the game's developer tools use) so that, times
+the game's own play/fast-forward speed, the game runs at N×. It checks the speed every tick and
+sets it again if the game resets it, and it puts the game back to normal speed when it exits.
+The bot also looks at the game N times as often, so it gets the same number of looks per game
+second. If the game won't take the speed, the bot logs "can't change the game speed" and plays
+on at normal speed.
+
+Unity's `Time.timeScale` can't be used because its setter is stripped from this build.
+`Game.SetTimeScale` with `TimeScale.FromScale` doesn't work either: `FromScale` returns
+`Single` for any value.
+
+The "game speed: N.Nx normal" line the bot logs overstates the speed, often about 2×. It
+compares against the clock rate it measured in the first seconds of a game, when the game runs
+slow. To see the real speed, compare the time between the daily status lines with a
+normal-speed run, where a game day takes about 20 seconds.
+
 `launch.sh` quits a running copy of the game before relaunching it. Opening the game normally,
 from Launchpad or the Dock, starts it without the bridge.
 
@@ -98,9 +135,9 @@ unlocks still go to your account.
 
 ## Limitations
 
-- Only plain roads, plus bridges and tunnels as straight crossings. Roundabouts, traffic
-  lights and motorways are picked as upgrades but never placed, and the bot doesn't reroute
-  congested roads, so busy late-game cities eventually jam and overflow.
+- Motorways are never placed, so the bot values them at 0 when picking upgrades. Congestion is
+  handled only through route-load costs, roundabouts, traffic lights and bypasses, so busy
+  late-game cities still jam and overflow eventually.
 - Houses that are already connected are never turned, even if another side would now be
   shorter.
 - `--start` only works from the main menu.
@@ -116,7 +153,10 @@ python3 -m unittest discover -s tests
 
 These are planner tests on small hand-built boards: turning a house onto an adjacent road,
 shortcutting a looping private road, dropping a doubled car park connection while keeping a
-loop that's the short way to a second destination, and reclaiming dead ends.
+loop that's the short way to a second destination, and reclaiming dead ends. They also cover
+route loads and junction picking, avoiding busy trunks, preferring a pressured destination's
+network, bypasses, needing a bridge to enter water, and drawing only the missing segments over
+an existing bridge.
 
 ## Tools
 
