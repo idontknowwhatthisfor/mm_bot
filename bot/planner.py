@@ -10,6 +10,7 @@ to face any of its 8 neighbours (drawing out of a house turns its driveway, as a
 from __future__ import annotations
 
 import heapq
+import math
 import itertools
 from dataclasses import dataclass, field, replace
 
@@ -18,21 +19,24 @@ from game import (DIRS, Content, Destination, House, Pos, State, Terrain, Upgrad
 
 BLOCKING = {Content.HOUSE, Content.DESTINATION, Content.CARPARK, Content.BOAT_TERMINAL}
 
-# Path costs, in road tiles. New road tiles dominate everything else, so a plan never spends a
-# tile it doesn't need; the small terms only break ties between equally short roads. A diagonal
-# step uses one tile like a straight one, which is what makes diagonal roads shorter.
-COST_EMPTY = 1.0
-COST_TREE = 1.05  # building over a tree clears it; same tile cost
-COST_EXISTING_ROAD = 0.1  # road that exists costs no tiles, but cutting across other networks adds junctions
+# Path costs, in tiles of driving. What matters is how long cars take to reach their destination,
+# so every tile a car drives costs COST_DRIVE (a diagonal step is DIAGONAL tiles long), and turning
+# costs a little more. Building a road tile costs COST_NEW_TILE on top: road tiles are still worth
+# saving, but less than the cars' time.
+DIAGONAL = math.sqrt(2)
+COST_DRIVE = 1.0
+COST_NEW_TILE = 0.5
+COST_TREE = 0.05  # building over a tree clears it; slightly worse than open ground
 # Cost of a bend, by its size in 45° steps. Cars slow down for 90° (and sharper) turns but not for
-# 45° bends, so a right angle costs a good fraction of a tile while a diagonal bend is just a tie-break.
-TURN_COST = (0.0, 0.01, 0.3)
+# 45° bends.
+TURN_COST = (0.0, 0.05, 0.5)
 COST_TURN_HOUSE = 0.05  # turning a house is free in the game, but don't churn for nothing
 COST_BRIDGE = 4.0  # on top of the tiles it spans; bridges are scarce
 MAX_CROSSING = 5
 MAX_TURN = 2  # in 45° steps: no road bends sharper than a right angle
-# Tie-break between equally short roads: join the network nearer the destination.
-COST_REMAINING_TRIP = 0.01
+# The rest of the trip, from where a new road joins the network to the destination, counts like the
+# new road itself.
+COST_REMAINING_TRIP = COST_DRIVE
 # Cars never route around traffic: every car of a colour takes the same free-flow route, so a trunk
 # carrying many houses jams. Road carrying more than LOAD_FREE houses costs COST_LOAD per extra house
 # to drive along or join, so new houses get their own way in rather than piling onto the busiest road.
@@ -48,6 +52,10 @@ COST_JUNCTION = 0.2
 COST_SHARED = 0.5
 COST_SHARED_JOIN = 1.0
 COST_SHARED_LOAD = 0.05
+# At most two colours share a road: a road tile that two other colours already use costs this much
+# to drive along, on the new road or anywhere on the rest of the trip. It is avoided whenever there
+# is any other way, but never makes a house impossible to connect.
+COST_COLOUR_CAP = 25.0
 # A house of a colour with a destination close to overcrowding will spend up to this many extra
 # tiles to join that destination's network instead of another one of its colour.
 COST_OTHER_NETWORK = 3.0
@@ -56,9 +64,27 @@ COST_OTHER_NETWORK = 3.0
 MIN_BYPASS_SAVING = 4
 # Among bypasses, one more new tile is worth it for every two tiles it takes off the trip.
 COST_BYPASS_TRIP = 0.5
-# Optimising existing roads may lengthen a house's trip by at most this many tiles.
-MAX_DETOUR_SHORTCUT = 2
-MAX_DETOUR_LOOP = 1
+# Optimising existing roads may never lengthen any house's trip.
+MAX_DETOUR_SHORTCUT = 0
+MAX_DETOUR_LOOP = 0
+# To keep colours apart, cutting a shortcut onto a shared road may lengthen a trip by this many tiles.
+MAX_SEPARATION_DETOUR = 8.0
+TRIP_EPSILON = 1e-6
+
+
+def step_length(d: int) -> float:
+    return DIAGONAL if d % 2 else 1.0
+
+
+def drive_length(a: Pos, b: Pos) -> float:
+    """Length of the drive between two neighbouring tiles."""
+    return DIAGONAL if a[0] != b[0] and a[1] != b[1] else 1.0
+
+
+def octile(a: Pos, b: Pos) -> float:
+    """Shortest possible drive between two tiles, straight and diagonal steps combined."""
+    dx, dy = abs(a[0] - b[0]), abs(a[1] - b[1])
+    return max(dx, dy) + (DIAGONAL - 1) * min(dx, dy)
 
 
 def turn_size(a: int, b: int) -> int:
@@ -141,6 +167,16 @@ class Board:
         others = sum(n for g, n in self.colours.get(p, {}).items() if g != self.group)
         return base + COST_SHARED_LOAD * others if others else 0.0
 
+    def capped(self, p: Pos) -> bool:
+        """Whether this colour on road tile p would make three colours share it."""
+        if self.group is None:
+            return False
+        others = {g for g in self.colours.get(p, {}) if g != self.group}
+        planned = self.planned.get(p)
+        if planned is not None and planned != self.group:
+            others.add(planned)
+        return len(others) >= 2
+
     def join_cost(self, p: Pos) -> float:
         """Extra cost of ending a new road on an existing road tile: its traffic, other colours on
         it, and a new junction."""
@@ -166,12 +202,14 @@ class Board:
             return False
         return t.water if kind == Upgrade.BRIDGE else t.mountain
 
-    def step_cost(self, p: Pos) -> float:
+    def step_cost(self, p: Pos, d: int) -> float:
+        """Cost of driving onto tile p in direction d, plus building it if it has no road yet."""
+        drive = COST_DRIVE * step_length(d)
         if self.is_road(p):
-            return COST_EXISTING_ROAD + self.load_cost(p) + self.shared_cost(p)
+            return drive + self.load_cost(p) + self.shared_cost(p) + (COST_COLOUR_CAP if self.capped(p) else 0.0)
         if self.state.content.get(p) == Content.TREE:
-            return COST_TREE
-        return COST_EMPTY
+            return drive + COST_NEW_TILE + COST_TREE
+        return drive + COST_NEW_TILE
 
     @staticmethod
     def corner(p: Pos, d: int) -> frozenset:
@@ -279,7 +317,7 @@ def search(board: Board, starts: list[Start], is_goal, bridges: int, tunnels: in
             q = neighbor(p, d)
             base = cost + TURN_COST[bend]
             if board.passable(q):
-                relax(key, (q, d), [], base + board.step_cost(q), used[key])
+                relax(key, (q, d), [], base + board.step_cost(q, d), used[key])
                 continue
             if d % 2:
                 continue  # bridges and tunnels run straight along an axis
@@ -301,8 +339,8 @@ def search(board: Board, starts: list[Start], is_goal, bridges: int, tunnels: in
                 started = bool(roads[0] and any(roads[0]))
                 if not started and used[key] >= budget:
                     continue
-                span_cost = sum(COST_EXISTING_ROAD if r and any(r) else COST_EMPTY for r in roads)
-                step = base + (0.0 if started else COST_BRIDGE) + span_cost + board.step_cost(landing)
+                span_cost = sum(COST_DRIVE + (0.0 if r and any(r) else COST_NEW_TILE) for r in roads)
+                step = base + (0.0 if started else COST_BRIDGE) + span_cost + board.step_cost(landing, d)
                 relax(key, (landing, d), spanned, step, used[key] + (0 if started else 1))
 
     if found is None:
@@ -363,13 +401,14 @@ def plan_house(board: Board, house: House, net: Network, roots: dict[int, set[Po
             return True
         return state.has_road(p) and net.find(p) in goal_roots and state.content.get(p) not in BLOCKING
 
-    trips = trip_lengths(state, house.group)
+    trips, crowded = trip_routes(state, house.group, colours=board.colours)
 
     def remaining_trip(p: Pos) -> float:
         if board.planned.get(p) == house.group and not state.has_road(p):
             return 0.0
-        trip = 0.0 if p in entrances else COST_REMAINING_TRIP * trips.get(p, 0)
-        return trip + board.join_cost(p) + network_cost(p)
+        trip = 0.0 if p in entrances else COST_REMAINING_TRIP * trips.get(p, 0.0)
+        capped = 0 if p in entrances else crowded.get(p, 0)
+        return trip + COST_COLOUR_CAP * capped + board.join_cost(p) + network_cost(p)
 
     found = search(board, _house_starts(board, house), lambda p: on_network(p) or p in entrances,
                    bridges, tunnels, goal_cost=remaining_trip)
@@ -388,6 +427,43 @@ def plan_house(board: Board, house: House, net: Network, roots: dict[int, set[Po
         segments.append((path[0], opposite(facing)))
     return Plan(f"house {house.pos}", ("house", house.pos), house.group, segments, path,
                 _new_tiles(board, path, {path[0]}), crossings, turned)
+
+
+def plan_feeder(board: Board, house: House, net: Network, dest: Destination, bridges: int,
+                tunnels: int) -> Plan | None:
+    """A road from a house on another network (its driveway tile) to a destination's network, for a
+    destination short of cars: the house's network then shares its cars with the destination. Cars
+    must arrive, so the two-colour limit doesn't apply."""
+    state = board.state
+    cp = state.carparks.get(dest.carpark)
+    if not cp or not cp.tiles:
+        return None
+    target = net.find(cp.tiles[0])
+    if net.find(house.pos) == target or not state.has_road(house.access):
+        return None
+    board = replace(board, group=None)
+    entrances = {outside: d for outside, _, d in entrances_for(state, dest.group, dest)}
+    trips = trip_lengths(state, dest.group, dest)
+
+    def is_goal(p: Pos) -> bool:
+        if p in entrances:
+            return True
+        return state.has_road(p) and net.find(p) == target and state.content.get(p) not in BLOCKING
+
+    def goal_cost(p: Pos) -> float:
+        return 0.0 if p in entrances else COST_REMAINING_TRIP * trips.get(p, 0.0) + board.join_cost(p)
+
+    found = search(board, [(house.access, house.driveway, 0.0)], is_goal, bridges, tunnels, goal_cost=goal_cost)
+    if found is None:
+        return None
+    path, crossings = found
+    if len(path) < 2:
+        return None
+    segments = _road_segments(path)
+    if not (state.has_road(path[-1]) and net.find(path[-1]) == target):
+        segments.append((path[-1], entrances[path[-1]]))  # into the car park
+    return Plan(f"feeder from house {house.pos} to destination {dest.tiles[0]}", ("feeder", dest.key), dest.group,
+                segments, path, _new_tiles(board, path), crossings)
 
 
 def plan_destination(board: Board, dest: Destination, net: Network, bridges: int, tunnels: int) -> Plan | None:
@@ -415,8 +491,22 @@ def plan_destination(board: Board, dest: Destination, net: Network, bridges: int
             return True
         return state.has_road(p) and net.find(p) in house_roots and state.content.get(p) not in BLOCKING
 
+    # Where the road meets the houses' network, every car still has to drive from its house to that
+    # point: join where that drive, averaged over the colour's connected houses, is shortest.
+    graph = RoadGraph(state)
+    from_houses: dict[Pos, list[float]] = {}
+    for h in houses:
+        if net.find(h.pos) != h.pos:
+            for t, dist in graph.distances([h.pos]).items():
+                from_houses.setdefault(t, []).append(dist)
+
+    def house_trip(p: Pos) -> float:
+        if p in house_at or p not in from_houses:
+            return 0.0
+        return COST_REMAINING_TRIP * sum(from_houses[p]) / len(from_houses[p])
+
     starts = [(outside, opposite(into), 0.0) for outside, into in into_park.items()]
-    found = search(board, starts, is_goal, bridges, tunnels)
+    found = search(board, starts, is_goal, bridges, tunnels, goal_cost=house_trip)
     if found is None:
         return None
     path, crossings = found
@@ -434,26 +524,43 @@ def plan_destination(board: Board, dest: Destination, net: Network, bridges: int
 
 # Network upkeep -----------------------------------------------------------------------------
 
-def trip_lengths(state: State, group: int, dest: Destination | None = None) -> dict[Pos, int]:
-    """Tiles of existing road to drive from each road tile to an active car park of a colour
-    (or to one destination's car park)."""
-    frontier = []
-    dist: dict[Pos, int] = {}
+def trip_routes(state: State, group: int, dest: Destination | None = None,
+                colours: dict[Pos, dict[int, int]] | None = None) -> tuple[dict[Pos, float], dict[Pos, int]]:
+    """Driving distance over existing road from each road tile to the nearest active car park of a
+    colour (or to one destination's car park), and how many tiles on that drive two other colours
+    already use."""
+    dist: dict[Pos, float] = {}
+    crowded: dict[Pos, int] = {}
+    heap = []
     for outside, park, _ in entrances_for(state, group, dest):
         for t in (outside, park):
             if state.has_road(t) and t not in dist:
-                dist[t] = 0
-                frontier.append(t)
-    while frontier:
-        nxt = []
-        for p in frontier:
-            for d, s in enumerate(state.roads.get(p, ())):
-                q = neighbor(p, d)
-                if s and q not in dist and state.road_toward(q, opposite(d)):
-                    dist[q] = dist[p] + 1
-                    nxt.append(q)
-        frontier = nxt
-    return dist
+                dist[t], crowded[t] = 0.0, 0
+                heapq.heappush(heap, (0.0, t))
+
+    def is_capped(t: Pos) -> bool:
+        return colours is not None and len({g for g in colours.get(t, {}) if g != group}) >= 2
+
+    while heap:
+        cost, p = heapq.heappop(heap)
+        if cost > dist[p]:
+            continue
+        for d, s in enumerate(state.roads.get(p, ())):
+            q = neighbor(p, d)
+            if not (s and state.road_toward(q, opposite(d))):
+                continue
+            nd = cost + step_length(d)
+            if nd < dist.get(q, float("inf")) - TRIP_EPSILON:
+                dist[q] = nd
+                crowded[q] = crowded[p] + (1 if is_capped(q) else 0)
+                heapq.heappush(heap, (nd, q))
+    return dist, crowded
+
+
+def trip_lengths(state: State, group: int, dest: Destination | None = None) -> dict[Pos, float]:
+    """Driving distance over existing road from each road tile to an active car park of a colour
+    (or to one destination's car park)."""
+    return trip_routes(state, group, dest)[0]
 
 
 def unfinished_crossings(state: State, terrain: dict[Pos, Terrain]) -> list[tuple[Pos, int]]:
@@ -560,28 +667,35 @@ class RoadGraph:
             out.update(cp.tiles)
         return out
 
-    def distances(self, sources: list[Pos]) -> dict[Pos, int]:
-        stops = self.endpoints()
-        dist = {s: 0 for s in sources}
-        frontier = list(sources)
-        while frontier:
-            nxt = []
-            for p in frontier:
-                if p in stops and dist[p] > 0:
-                    continue
-                for q in self.adj.get(p, ()):
-                    if q not in dist:
-                        dist[q] = dist[p] + 1
-                        nxt.append(q)
-            frontier = nxt
-        return dist
+    def distances(self, sources: list[Pos]) -> dict[Pos, float]:
+        """Driving distance from the nearest source to every tile reachable from it."""
+        return self.shortest(sources)[0]
 
-    def evaluate(self) -> tuple[dict[tuple[Pos, int], int | None], set[int]]:
+    def shortest(self, sources: list[Pos]) -> tuple[dict[Pos, float], dict[Pos, Pos | None]]:
+        """Driving distances from the nearest source, and each tile's next tile toward it. Cars
+        don't drive through houses or car parks, except the source ones."""
+        stops = self.endpoints()
+        dist: dict[Pos, float] = {s: 0.0 for s in sources}
+        parent: dict[Pos, Pos | None] = {s: None for s in sources}
+        heap = [(0.0, s) for s in sources]
+        heapq.heapify(heap)
+        while heap:
+            cost, p = heapq.heappop(heap)
+            if cost > dist[p] or (p in stops and parent[p] is not None):
+                continue
+            for q in self.adj.get(p, ()):
+                nd = cost + drive_length(p, q)
+                if nd < dist.get(q, float("inf")) - TRIP_EPSILON:
+                    dist[q], parent[q] = nd, p
+                    heapq.heappush(heap, (nd, q))
+        return dist, parent
+
+    def evaluate(self) -> tuple[dict[tuple[Pos, int], float | None], set[int]]:
         """(trip length from each house to each active destination of its colour, keyed by
         (house tile, destination); destinations that some house of their colour can reach).
         Cars serve every destination of their colour, not just the nearest."""
         state = self.state
-        trips: dict[tuple[Pos, int], int | None] = {}
+        trips: dict[tuple[Pos, int], float | None] = {}
         fed: set[int] = set()
         for dest in state.destinations.values():
             cp = state.carparks.get(dest.carpark)
@@ -660,6 +774,9 @@ def redundant_tiles(state: State, terrain: dict[Pos, Terrain], max_detour: int =
     keep = _protected(state, terrain)
     graph = RoadGraph(state)
     base_trips, base_fed = graph.evaluate()
+    base_mixed = mixed_tiles(state, graph)
+    if base_mixed and separation_cut(state, terrain):
+        return []  # a road of a colour's own looks redundant until the cut onto the shared road is made
     removed: list[Pos] = []
     while True:
         best = None
@@ -670,9 +787,11 @@ def redundant_tiles(state: State, terrain: dict[Pos, Terrain], max_detour: int =
             trips, fed = smaller.evaluate()
             if not base_fed <= fed:
                 continue
-            if any(t is not None and (trips.get(k) is None or trips[k] > t + max_detour)
+            if any(t is not None and (trips.get(k) is None or trips[k] > t + max_detour + TRIP_EPSILON)
                    for k, t in base_trips.items()):
                 continue
+            if len(mixed_tiles(state, smaller)) > len(base_mixed):
+                continue  # a road kept to hold colours apart: without it, three share a road
             gain = 1 + len(chain)
             if best is None or gain > best[0]:
                 best = (gain, [p] + chain, smaller)
@@ -680,6 +799,40 @@ def redundant_tiles(state: State, terrain: dict[Pos, Terrain], max_detour: int =
             return removed
         removed.extend(best[1])
         graph = best[2]
+
+
+def separation_cut(state: State, terrain: dict[Pos, Terrain],
+                   max_detour: float = MAX_SEPARATION_DETOUR) -> list[Pos]:
+    """Cars always take the shortest road, so a road of a colour's own next to a shared main road
+    only helps once the shortcut onto the main road is gone. Find the road tile (with the chain it
+    leaves dead-ended) whose removal puts the fewest colours over two on any tile, as long as every
+    house still reaches every destination it reached, and no trip grows by more than max_detour.
+    Returns the tiles to clear, cut first, or [] when no cut separates colours."""
+    keep = _protected(state, terrain)
+    graph = RoadGraph(state)
+    mixed = mixed_tiles(state, graph)
+    if not mixed:
+        return []
+    base_trips, base_fed = graph.evaluate()
+    best = None
+    for p in graph.adj:
+        if p in keep or not graph.on_cycle(p):
+            continue
+        smaller, chain = graph.without({p}).prune(keep)
+        after = mixed_tiles(state, smaller)
+        if len(after) >= len(mixed):
+            continue
+        trips, fed = smaller.evaluate()
+        if not base_fed <= fed:
+            continue
+        if any(t is not None and (trips.get(k) is None or trips[k] > t + max_detour + TRIP_EPSILON)
+               for k, t in base_trips.items()):
+            continue
+        longer = sum(trips[k] - t for k, t in base_trips.items() if t is not None)
+        score = (len(after), longer)
+        if best is None or score < best[0]:
+            best = (score, [p] + chain)
+    return best[1] if best else []
 
 
 def house_spur(state: State, terrain: dict[Pos, Terrain], house: House, graph: RoadGraph | None = None) -> list[Pos]:
@@ -741,7 +894,9 @@ def plan_shortcut(state: State, terrain: dict[Pos, Terrain], house: House, refus
                     after.adj.setdefault(outside, set()).add(park)
                     after.adj.setdefault(park, set()).add(outside)
     trips_after, _ = after.evaluate()
-    if any(trips_after.get(k) is None or trips_after[k] > t + MAX_DETOUR_SHORTCUT for k, t in mine.items()):
+    if len(mixed_tiles(state, after)) > len(mixed_tiles(state, graph)):
+        return None  # it would put a third colour on a road
+    if any(trips_after.get(k) is None or trips_after[k] > t + MAX_DETOUR_SHORTCUT + TRIP_EPSILON for k, t in mine.items()):
         return None
     plan.label = f"shortcut for house {house.pos}"
     plan.key = ("shortcut", house.pos)
@@ -751,6 +906,11 @@ def plan_shortcut(state: State, terrain: dict[Pos, Terrain], house: House, refus
 
 
 # Traffic ------------------------------------------------------------------------------------
+
+def mixed_tiles(state: State, graph: RoadGraph | None = None) -> set[Pos]:
+    """Road tiles that more than two colours' cars drive over."""
+    return {p for p, by_colour in route_colours(state, graph).items() if len(by_colour) > 2}
+
 
 def route_loads(state: State, graph: RoadGraph | None = None) -> dict[Pos, int]:
     """For each road tile, how many houses drive over it on their way to the nearest destination
@@ -777,20 +937,8 @@ def route_colours(state: State, graph: RoadGraph | None = None) -> dict[Pos, dic
 
 
 def _add_routes(state: State, graph: RoadGraph, group: int, sources: list[Pos], load: dict[Pos, int]):
-    """Count, on each road tile, the houses of a colour whose shortest road to the sources uses it."""
-    stops = graph.endpoints()
-    parent: dict[Pos, Pos | None] = {s: None for s in sources}
-    frontier = list(sources)
-    while frontier:
-        nxt = []
-        for p in frontier:
-            if p in stops and parent[p] is not None:
-                continue
-            for q in graph.adj.get(p, ()):
-                if q not in parent:
-                    parent[q] = p
-                    nxt.append(q)
-        frontier = nxt
+    """Count, on each road tile, the houses of a colour whose shortest drive to the sources uses it."""
+    _, parent = graph.shortest(sources)
     for h in state.houses:
         if h.group != group or h.pos not in parent:
             continue
@@ -830,12 +978,9 @@ def plan_bypass(board: Board, dest: Destination, bridges: int, tunnels: int) -> 
     if not starts or not trips:
         return None
 
-    def tiles_apart(a: Pos, b: Pos) -> int:
-        return max(abs(a[0] - b[0]), abs(a[1] - b[1]))  # a diagonal step is one tile, like a straight one
-
     goals = {p for p, t in trips.items()
              if p in on_route and state.content.get(p) not in BLOCKING
-             and t - min(tiles_apart(p, s[0]) for s in starts) >= MIN_BYPASS_SAVING}
+             and t - min(octile(p, s[0]) for s in starts) >= MIN_BYPASS_SAVING}
     if not goals:
         return None
     longest = max(trips[p] for p in goals)
@@ -845,7 +990,7 @@ def plan_bypass(board: Board, dest: Destination, bridges: int, tunnels: int) -> 
     if found is None:
         return None
     path, crossings = found
-    saving = trips[path[-1]] - (len(path) - 1)
+    saving = trips[path[-1]] - sum(drive_length(a, b) for a, b in zip(path, path[1:]))
     if saving < MIN_BYPASS_SAVING or len(path) < 3:
         return None
     return Plan(f"bypass to destination {dest.tiles[0]}", ("bypass", dest.key), dest.group, _road_segments(path),

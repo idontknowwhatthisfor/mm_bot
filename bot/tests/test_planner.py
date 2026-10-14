@@ -10,7 +10,7 @@ from bot import Bot  # noqa: E402
 from game import (EDIT_ALREADY_EXISTS, EDIT_SUCCESS, Carpark, Content, Destination, House, State, Terrain,  # noqa: E402
                   direction_between, join_roundabouts)
 from planner import (Board, Network, RoadGraph, dead_ends, group_roots, junctions_by_load,  # noqa: E402
-                     plan_bypass, plan_destination, plan_house, plan_shortcut, redundant_tiles, route_colours,
+                     mixed_tiles, plan_bypass, plan_destination, plan_feeder, plan_house, plan_shortcut, redundant_tiles, route_colours, separation_cut,
                      route_loads, unfed_destinations)
 
 N, E, S, W = 0, 2, 4, 6
@@ -345,8 +345,7 @@ class TrafficTests(unittest.TestCase):
 
     def test_house_keeps_off_another_colours_road(self):
         # Colour 0's trunk runs along row 9; colour 1's road comes down column 5 and meets it. A new
-        # colour 1 house just above the trunk would ride colour 0's road for free, but one new tile
-        # takes it straight to its own colour's road instead.
+        # colour 1 house above the trunk takes one new tile straight to its own colour's road.
         m = Map()
         m.destination(*DEST_EAST)
         m.link((9, 9), (10, 9))
@@ -360,11 +359,75 @@ class TrafficTests(unittest.TestCase):
         net = Network(st)
         colours = route_colours(st)
         shared = [p for p, by_colour in colours.items() if 0 in by_colour]
-        plain = plan_house(Board(st, m.terrain), house, net, group_roots(st, net), 0, 0)
-        self.assertTrue(set(plain.tiles) & set(shared))  # without the colour cost it rides colour 0's road
         plan = plan_house(Board(st, m.terrain, colours=colours), house, net, group_roots(st, net), 0, 0)
         self.assertEqual(set(plan.tiles) & set(shared), set())
         self.assertEqual(plan.new_tiles, 1)
+
+
+    def test_no_third_colour_on_a_road_anywhere_on_the_trip(self):
+        # Two other colours already use row 9 west of the car park. A colour 2 house just above it
+        # would join at (6, 9) and drive on along row 9; with the cap it builds its own way in.
+        m = Map()
+        m.destination(*DEST_EAST, group=2)
+        m.link((9, 9), (10, 9))
+        m.road(*[(x, 9) for x in range(9, 1, -1)])
+        house = m.house((6, 11), S, group=2)
+        st = m.state()
+        net = Network(st)
+        shared = {(x, 9): {0: 3, 1: 3} for x in range(2, 9)}
+        plain = plan_house(Board(st, m.terrain), house, net, group_roots(st, net), 0, 0)
+        self.assertTrue(set(plain.tiles) & set(shared))
+        plan = plan_house(Board(st, m.terrain, colours=shared), house, net, group_roots(st, net), 0, 0)
+        self.assertEqual(set(plan.tiles) & set(shared), set())
+        self.assertEqual(plan.tiles[-1], (9, 9))  # straight to the car park entrance
+
+
+    def test_feeder_joins_a_house_network_to_a_destination_short_of_cars(self):
+        m = Map()
+        dest = m.destination(*DEST_EAST)
+        m.link((9, 9), (10, 9))
+        m.road((9, 9), (8, 9), (7, 9))
+        house = m.house((3, 12), S)  # on a stub of its own, away from the destination's network
+        m.link((3, 12), (3, 11))
+        st = m.state()
+        net = Network(st)
+        plan = plan_feeder(Board(st, m.terrain), house, net, dest, 0, 0)
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan.tiles[0], (3, 11))  # drawn out of the house's driveway tile
+        end = plan.tiles[-1]
+        self.assertTrue(net.find(end) == net.find((10, 9)) or end == (9, 9))
+
+
+    def _three_colours_on_row_9(self):
+        """Colours 0 and 1 drive east along row 9 and north up column 8 to their car parks. Colour 2's
+        house has a short spur onto row 9 at (4, 10) and a longer road of its own along row 12."""
+        m = Map()
+        m.destination(*DEST_EAST, group=2)
+        m.link((9, 9), (10, 9))
+        m.destination([(10, 3), (11, 3), (10, 4), (11, 4)], [(10, 5), (11, 5)], (9, 5), W, group=0)
+        m.link((9, 5), (10, 5))
+        m.destination([(10, 0), (11, 0), (10, 1), (11, 1)], [(10, 2), (11, 2)], (9, 2), W, group=1)
+        m.link((9, 2), (10, 2))
+        m.road(*[(x, 9) for x in range(2, 10)])
+        m.road(*[(8, y) for y in range(9, 1, -1)], (9, 2))
+        m.link((8, 5), (9, 5))
+        m.house((2, 10), S, group=0)
+        m.link((2, 10), (2, 9))
+        m.house((3, 8), N, group=1)
+        m.link((3, 8), (3, 9))
+        m.house((3, 11), E, group=2)
+        m.link((3, 11), (4, 11))
+        m.road((4, 11), (4, 10), (4, 9))  # the short way onto the shared road
+        m.road((4, 11), (4, 12), *[(x, 12) for x in range(5, 9)], (9, 11), (9, 10), (9, 9))  # its own road
+        return m
+
+    def test_cut_moves_a_third_colour_onto_its_own_road(self):
+        m = self._three_colours_on_row_9()
+        st = m.state()
+        self.assertTrue(mixed_tiles(st))  # colour 2 takes the short way along row 9 with 0 and 1
+        cut = separation_cut(st, m.terrain)
+        self.assertEqual(cut[:1], [(4, 10)])
+        self.assertNotIn((5, 12), redundant_tiles(st, m.terrain))  # its own road stays
 
 
 if __name__ == "__main__":

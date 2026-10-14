@@ -19,8 +19,9 @@ from game import (EDIT_ALREADY_EXISTS, EDIT_RESULT_NAMES, EDIT_SKIPPED, EDIT_SUC
                   neighbor)
 from mmbridge import Bridge, BridgeError
 from planner import (MAX_DETOUR_LOOP, Board, Network, RoadGraph, dead_ends, group_roots, house_spur, is_served,
-                     junctions_by_load, plan_bypass, plan_destination, plan_house, plan_shortcut, redundant_tiles,
-                     route_colours, unfed_destinations, unfinished_crossings)
+                     junctions_by_load, octile, plan_bypass, plan_destination, plan_feeder, plan_house,
+                     plan_shortcut, redundant_tiles, route_colours, separation_cut, unfed_destinations,
+                     unfinished_crossings)
 
 log = logging.getLogger("bot")
 
@@ -43,7 +44,10 @@ REMEMBER_REFUSED_FOR = 60.0  # sim seconds a move the game refused is kept out o
 NOT_ABOUT_THE_MOVE = {-2, -1, 5, 6, 7, 13}
 DIRECTION_NAMES = "N NE E SE S SW W NW".split()
 OPTIMISE_EVERY = 5.0  # sim seconds between passes that shorten roads already built
+BUILT_THEN_CLEARED = 10.0  # sim seconds: a road cleared this soon after being drawn didn't join
+SHORTCUT_TRUST = 20.0  # sim seconds after a shortcut in which losing the house's connection blames it
 SHORTCUT_CANDIDATES = 12  # houses with the longest private roads considered per pass
+FEEDER_CANDIDATES = 4  # houses with idle cars tried per destination short of cars
 MIN_TICK = 0.05  # real seconds between looks at the game, however fast it runs
 # A destination is under pressure once its pins (plus how far its overcrowd timer has run) reach
 # this share of its limit. Houses of its colour then prefer its network, loops near it are kept,
@@ -79,6 +83,8 @@ class Bot:
         self.choice_seen_at: float | None = None
         self.served_at_day_start: dict[int, int] = {}  # destination -> pins served when the day began
         self.cannot_place: set[Upgrade] = set()  # junction upgrades the game wouldn't take
+        self.shortcut_at: dict = {}  # house -> sim time of its last shortcut
+        self.built: dict = {}  # tile -> (sim time, segments touching it) for roads drawn recently
         self.values = dict(UPGRADE_VALUE)
 
     def run(self, stop_at_game_end: bool = True):
@@ -145,6 +151,8 @@ class Bot:
         self.next_optimise = 0.0
         self.served_at_day_start.clear()
         self.cannot_place.clear()
+        self.shortcut_at.clear()
+        self.built.clear()
         water = any(t.water for t in self.s.terrain.values())
         mountains = any(t.mountain for t in self.s.terrain.values())
         self.values = dict(UPGRADE_VALUE)
@@ -229,6 +237,11 @@ class Bot:
         # (each connected house is more cars for it), then those with cars already waiting.
         short = {d.group for d in self.pressured(state)}
         unserved = [h for h in state.houses if not is_served(h, net, roots)]
+        for h in unserved:
+            # A shortcut that left its house cut off would be built and undone over and over.
+            if state.time - self.shortcut_at.pop(h.pos, -SHORTCUT_TRUST) < SHORTCUT_TRUST:
+                log.info("shortcut for house %s cut it off; no more shortcuts for it", h.pos)
+                self.skip_until[("shortcut", h.pos)] = float("inf")
         for house in sorted(unserved, key=lambda h: (h.group not in short, -h.waiting)):
             take(plan_house(board, house, net, roots, budget["bridges"], budget["tunnels"], pressured))
         if not plans:
@@ -300,6 +313,9 @@ class Bot:
                 self.failures[plan.key] = 0
             return False
         self.failures.pop(plan.key, None)
+        for p, d in plan.segments:
+            for t in (p, neighbor(p, d)):
+                self.built.setdefault(t, (state.time, []))[1].append((p, d))
         log.info("%s (colour %d): road of %d tiles (%d new)%s%s%s", plan.label, plan.group, len(plan.tiles),
                  plan.new_tiles, f", {plan.crossings} crossing(s)" if plan.crossings else "",
                  ", turned the house" if plan.turned_house else "",
@@ -335,6 +351,38 @@ class Bot:
                     f"bridges {state.available[Upgrade.BRIDGE]}, tunnels {state.available[Upgrade.TUNNEL]}")
         return ""
 
+    def feed_short_destinations(self, state: State, board: Board, pressured: list) -> bool:
+        """A destination under pressure whose pins wait with no car sent is short of cars: unless the
+        colour has idle cars it can already reach, connect the nearest house of its colour that has
+        idle cars but sits on another network. (When every pin has a car on the way, the cars are
+        there but slow, and the bypass below reworks the roads instead.)"""
+        net = Network(state)
+        for dest in pressured:
+            if dest.unassigned == 0 or self.skip_until.get(("feeder", dest.key), -1) >= state.time:
+                continue
+            cp = state.carparks.get(dest.carpark)
+            if not cp or not cp.tiles:
+                continue
+            target = net.find(cp.tiles[0])
+            same = [h for h in state.houses if h.group == dest.group]
+            if any(h.waiting for h in same if net.find(h.pos) == target):
+                continue  # idle cars already reach it: not a supply problem
+            unused = sorted((h for h in same if h.waiting and net.find(h.pos) != target),
+                            key=lambda h: octile(h.pos, cp.tiles[0]))
+            for house in unused[:FEEDER_CANDIDATES]:
+                plan = plan_feeder(board, house, net, dest, state.available[Upgrade.BRIDGE],
+                                   state.available[Upgrade.TUNNEL])
+                if plan is None or plan.new_tiles > state.available[Upgrade.CONCRETE]:
+                    continue
+                log.info("destination %s is short of cars (%d pins with none sent); feeding it from house %s",
+                         dest.tiles[0], dest.unassigned, house.pos)
+                self.record(state, plan, self.draw(state, plan.segments, sequential=self.crosses(plan)))
+                self.skip_until[("feeder", dest.key)] = state.time + GIVE_UP_FOR
+                self.last_build_time = state.time
+                return True
+            self.skip_until[("feeder", dest.key)] = state.time + GIVE_UP_FOR
+        return False
+
     def optimise(self, state: State, refused: set, load: dict) -> bool:
         """Improve roads already built. First, a destination whose cars are slow to arrive gets a
         bypass from its car park to the far side of its network. Then houses whose private road is
@@ -347,6 +395,8 @@ class Bot:
         started = time.monotonic()
         pressured = self.pressured(state)
         board = Board(state, terrain, refused, load=load)
+        if self.feed_short_destinations(state, board, pressured):
+            return True
         for dest in pressured:
             if dest.en_route < BYPASS_MIN_EN_ROUTE or self.skip_until.get(("bypass", dest.key), -1) >= state.time:
                 continue
@@ -370,9 +420,23 @@ class Bot:
                                  state.available[Upgrade.TUNNEL], graph, trips)
             if plan is None or plan.new_tiles > state.available[Upgrade.CONCRETE]:
                 continue
+            self.shortcut_at[house.pos] = state.time
             self.record(state, plan, self.draw(state, plan.segments, sequential=self.crosses(plan)))
             self.last_build_time = state.time
             return True
+
+        cut = [p for p in separation_cut(state, terrain) if self.skip_until.get(("clear", p), -1) < state.time]
+        if cut:
+            codes = self.s.clear_tiles(cut, sequential=True)
+            cleared = [p for p, c in zip(cut, codes) if c == EDIT_SUCCESS]
+            for p, c in zip(cut, codes):
+                if c not in (EDIT_SUCCESS, EDIT_SKIPPED):
+                    self.skip_until[("clear", p)] = state.time + GIVE_UP_FOR
+            if cleared:
+                log.info("cut %d road tile(s) at %s so no road carries more than two colours",
+                         len(cleared), ", ".join(map(str, cleared)))
+            self.last_build_time = state.time
+            return bool(cleared)
 
         # While a destination is close to overcrowding, keep every road that makes any trip shorter.
         detour = 0 if pressured else MAX_DETOUR_LOOP
@@ -416,6 +480,14 @@ class Bot:
             return False
         codes = self.s.clear_tiles(tiles, sequential=True)
         cleared = [p for p, c in zip(tiles, codes) if c == EDIT_SUCCESS]
+        for p in cleared:
+            # A road that dead-ends as soon as it is drawn didn't join where the plan expected: keep
+            # its moves out of plans for a while instead of drawing and clearing it again and again.
+            when, segments = self.built.pop(p, (None, []))
+            if when is not None and state.time - when < BUILT_THEN_CLEARED:
+                log.info("road just drawn at %s dead-ended; avoiding it for now", p)
+                for segment in segments:
+                    self.refused[segment] = state.time + REMEMBER_REFUSED_FOR
         for p, c in zip(tiles, codes):
             if c not in (EDIT_SUCCESS, EDIT_SKIPPED):
                 self.skip_until[("clear", p)] = state.time + GIVE_UP_FOR
