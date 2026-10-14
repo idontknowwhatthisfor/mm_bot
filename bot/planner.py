@@ -158,6 +158,12 @@ class Board:
     def move_allowed(self, p: Pos, d: int) -> bool:
         if (p, d) in self.refused:
             return False
+        # A roundabout keeps the exits it was built with: the game accepts a road drawn into it from
+        # another side but never joins it, which leaves a stub that is cleared and planned again.
+        q = neighbor(p, d)
+        if (p in self.state.roundabouts and not self.state.joined(p, d)) or \
+                (q in self.state.roundabouts and not self.state.joined(q, opposite(d))):
+            return False
         if d % 2:  # diagonal: may not cross another diagonal at the same corner
             corner = self.corner(p, d)
             if corner in self.planned_corners:
@@ -449,7 +455,7 @@ def dead_ends(state: State, terrain: dict[Pos, Terrain]) -> list[Pos]:
     house's driveway tile or a car park entrance (e.g. left behind after a house was turned or a
     road was refused halfway). Clearing them returns their tiles to the inventory.
     Bridges and tunnels, and the tiles next to them, are left alone."""
-    keep: set[Pos] = {h.access for h in state.houses}
+    keep: set[Pos] = {h.access for h in state.houses} | state.roundabouts | state.traffic_lights
     for cp in state.carparks.values():
         keep.update(outside for outside, _ in cp.entrances)
     for p, dirs in state.roads.items():
@@ -599,9 +605,10 @@ class RoadGraph:
 
 
 def _protected(state: State, terrain: dict[Pos, Terrain]) -> set[Pos]:
-    """Road tiles optimisation must not clear: driveways, car park entrances, bridges/tunnels and
-    the tiles next to them, and anything that isn't plain driveable ground."""
-    keep: set[Pos] = {h.access for h in state.houses}
+    """Road tiles optimisation must not clear: driveways, car park entrances, roundabouts and
+    traffic lights, bridges/tunnels and the tiles next to them, and anything that isn't plain
+    driveable ground."""
+    keep: set[Pos] = {h.access for h in state.houses} | state.roundabouts | state.traffic_lights
     for cp in state.carparks.values():
         keep.update(outside for outside, _ in cp.entrances)
     for p, dirs in state.roads.items():

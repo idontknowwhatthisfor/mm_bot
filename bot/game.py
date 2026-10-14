@@ -93,6 +93,19 @@ def _value(v, default=None):
     return v
 
 
+def join_roundabouts(roads: dict[Pos, list[int]], roundabouts: set[Pos]):
+    """A roundabout's centre tile keeps its connections in the roundabout, not in its two-lane road
+    state, which reads as empty. Mark it as joined to every neighbour whose road points into it, so
+    networks, routes and dead-end checks see a junction there rather than a gap."""
+    for p in roundabouts:
+        r = list(roads.get(p) or [0] * 8)
+        for d in range(8):
+            q = roads.get(neighbor(p, d))
+            if q and q[opposite(d)]:
+                r[d] = r[d] or 8
+        roads[p] = r
+
+
 @dataclass
 class House:
     pos: Pos
@@ -353,6 +366,7 @@ class Session:
                         cp.entrances.append((_pos(t["p"]["tlc"]), t["p"]["tld"]))
                     if t["p"]["br"]:
                         cp.entrances.append((_pos(t["p"]["brc"]), t["p"]["brd"]))
+        join_roundabouts(roads, roundabouts)
         return State(roads, content, houses, destinations, carparks, upgrades["available"], upgrades["pending"],
                      clock["week"], clock["day"], clock["hour"], clock["time"], clock["expansion"],
                      bool(clock["paused"]), score, bool(ended), playable, roundabouts, lights)

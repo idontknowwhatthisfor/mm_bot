@@ -8,9 +8,10 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 from bot import Bot  # noqa: E402
 from game import (EDIT_ALREADY_EXISTS, EDIT_SUCCESS, Carpark, Content, Destination, House, State, Terrain,  # noqa: E402
-                  direction_between)
+                  direction_between, join_roundabouts)
 from planner import (Board, Network, RoadGraph, dead_ends, group_roots, junctions_by_load,  # noqa: E402
-                     plan_bypass, plan_destination, plan_house, plan_shortcut, redundant_tiles, route_loads)
+                     plan_bypass, plan_destination, plan_house, plan_shortcut, redundant_tiles, route_loads,
+                     unfed_destinations)
 
 N, E, S, W = 0, 2, 4, 6
 
@@ -286,6 +287,41 @@ class TrafficTests(unittest.TestCase):
         self.assertEqual([seg for seg in sent if st.joined(*seg)], [])
         self.assertEqual(codes.count(EDIT_ALREADY_EXISTS), len(plan.segments) - len(sent))
         self.assertEqual(codes.count(EDIT_SUCCESS), len(sent))
+
+
+    def test_roundabout_centre_joins_the_roads_into_it(self):
+        # The game keeps a roundabout's connections out of its centre tile's two-lane road state, so
+        # the centre reads as roadless. Without joining it back, the car park beyond it looked cut off
+        # (fed again every tick) and the roads into it looked like dead ends (cleared every tick).
+        m = Map()
+        m.destination(*DEST_EAST)
+        m.link((9, 9), (10, 9))
+        m.road((9, 9), (8, 9), (7, 9), (6, 9))
+        m.house((6, 10), S)
+        m.link((6, 10), (6, 9))
+        st = m.state()
+        st.roads[(8, 9)] = [0] * 8  # the roundabout centre as the game reports it
+        st.roundabouts.add((8, 9))
+        self.assertTrue(unfed_destinations(st, Network(st)))
+        self.assertTrue(dead_ends(st, m.terrain))
+        join_roundabouts(st.roads, st.roundabouts)
+        self.assertEqual(st.links((8, 9)), 2)
+        self.assertEqual(unfed_destinations(st, Network(st)), [])
+        self.assertEqual(dead_ends(st, m.terrain), [])
+        self.assertNotIn((8, 9), redundant_tiles(st, m.terrain))
+
+    def test_new_roads_use_only_a_roundabouts_existing_exits(self):
+        m = Map()
+        m.destination(*DEST_EAST)
+        m.link((9, 9), (10, 9))
+        m.road((9, 9), (8, 9), (7, 9))
+        house = m.house((8, 6), S)
+        st = m.state()
+        st.roundabouts.add((8, 9))  # joined east and west only
+        net = Network(st)
+        plan = plan_house(Board(st, m.terrain), house, net, group_roots(st, net), 0, 0)
+        self.assertNotIn((8, 8), plan.tiles[-1:])  # never ends on the roundabout's free north side
+        self.assertNotEqual(plan.tiles[-1], (8, 9))
 
 
 if __name__ == "__main__":
