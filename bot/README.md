@@ -177,6 +177,8 @@ an existing bridge.
 
 ## Tools
 
+For how the code works in detail, see [docs/](docs/README.md).
+
 - Once a day, and again at game over, the bot logs each destination's pins (no car yet / car on
   the way), that day's arrivals, its overcrowd timer, and how many cars of its colour are idle.
 - `tools/board.py` prints the running game as an ASCII map, with each destination's pins and
