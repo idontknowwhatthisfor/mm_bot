@@ -40,6 +40,14 @@ LOAD_FREE = 6
 COST_LOAD = 0.15
 # Joining a road where it would become a junction slows every car through it.
 COST_JUNCTION = 0.2
+# Colours are kept on separate roads where possible: a car of one colour on another colour's road
+# adds to that road's queue and junctions without serving anyone there. Driving along road that
+# other colours' houses use costs COST_SHARED a tile, plus COST_SHARED_LOAD per such house; ending a
+# new road on one costs COST_SHARED_JOIN, so a house spends up to about one extra tile to join a
+# road of its own colour instead.
+COST_SHARED = 0.5
+COST_SHARED_JOIN = 1.0
+COST_SHARED_LOAD = 0.05
 # A house of a colour with a destination close to overcrowding will spend up to this many extra
 # tiles to join that destination's network instead of another one of its colour.
 COST_OTHER_NETWORK = 3.0
@@ -109,6 +117,8 @@ class Board:
     planned: dict[Pos, int] = field(default_factory=dict)  # tile -> colour whose network it joins
     planned_corners: set[frozenset] = field(default_factory=set)  # corners crossed by planned diagonals
     load: dict[Pos, int] = field(default_factory=dict)  # houses whose route uses each road tile
+    colours: dict[Pos, dict[int, int]] = field(default_factory=dict)  # tile -> colour -> houses routed over it
+    group: int | None = None  # colour of the road being planned, for the shared-road cost
     # When set, the only existing road tiles a search may step on (for roads that must be all new).
     road_allowed: set[Pos] | None = None
 
@@ -118,11 +128,22 @@ class Board:
     def load_cost(self, p: Pos) -> float:
         return COST_LOAD * max(0, self.load.get(p, 0) - LOAD_FREE)
 
+    def shared_cost(self, p: Pos, base: float = COST_SHARED) -> float:
+        """Extra cost of putting this colour's cars on a road tile other colours use."""
+        if self.group is None:
+            return 0.0
+        if self.planned.get(p, self.group) != self.group:
+            return base
+        others = sum(n for g, n in self.colours.get(p, {}).items() if g != self.group)
+        return base + COST_SHARED_LOAD * others if others else 0.0
+
     def join_cost(self, p: Pos) -> float:
-        """Extra cost of ending a new road on an existing road tile: its traffic, and a new junction."""
+        """Extra cost of ending a new road on an existing road tile: its traffic, other colours on
+        it, and a new junction."""
         if not self.state.has_road(p):
             return 0.0
-        return self.load_cost(p) + (COST_JUNCTION if self.state.links(p) >= 2 else 0.0)
+        junction = COST_JUNCTION if self.state.links(p) >= 2 else 0.0
+        return self.load_cost(p) + self.shared_cost(p, COST_SHARED_JOIN) + junction
 
     def passable(self, p: Pos) -> bool:
         if not self.state.in_playable(p):
@@ -143,7 +164,7 @@ class Board:
 
     def step_cost(self, p: Pos) -> float:
         if self.is_road(p):
-            return COST_EXISTING_ROAD + self.load_cost(p)
+            return COST_EXISTING_ROAD + self.load_cost(p) + self.shared_cost(p)
         if self.state.content.get(p) == Content.TREE:
             return COST_TREE
         return COST_EMPTY
@@ -319,6 +340,7 @@ def plan_house(board: Board, house: House, net: Network, roots: dict[int, set[Po
     to a car park entrance of its colour. With pressured (network roots holding a destination close
     to overcrowding), joining one of those networks is preferred by up to COST_OTHER_NETWORK tiles,
     since cars only reach destinations on their own network."""
+    board = replace(board, group=house.group)
     state = board.state
     goal_roots = roots.get(house.group, set())
     entrances = {outside: d for outside, _, d in entrances_for(state, house.group)}
@@ -366,6 +388,7 @@ def plan_house(board: Board, house: House, net: Network, roots: dict[int, set[Po
 def plan_destination(board: Board, dest: Destination, net: Network, bridges: int, tunnels: int) -> Plan | None:
     """Shortest road from a destination's car park entrance to a network holding houses of its
     colour, or to a house of its colour (turning it to face the road if needed)."""
+    board = replace(board, group=dest.group)
     state = board.state
     cp = state.carparks[dest.carpark]
     into_park = {outside: opposite(d) for outside, d in cp.entrances}
@@ -726,13 +749,24 @@ def route_loads(state: State, graph: RoadGraph | None = None) -> dict[Pos, int]:
     """For each road tile, how many houses drive over it on their way to the nearest destination
     of their colour. The game routes every car along the free-flow shortest road and never around
     traffic, so this is where the cars actually go (shortest by tiles, as an approximation)."""
-    graph = graph or RoadGraph(state)
     load: dict[Pos, int] = {}
+    for p, by_colour in route_colours(state, graph).items():
+        load[p] = sum(by_colour.values())
+    return load
+
+
+def route_colours(state: State, graph: RoadGraph | None = None) -> dict[Pos, dict[int, int]]:
+    """route_loads split by colour: for each road tile, colour -> houses routed over it."""
+    graph = graph or RoadGraph(state)
+    out: dict[Pos, dict[int, int]] = {}
     for group in {h.group for h in state.houses}:
         sources = [t for d in state.destinations.values() if d.active and d.group == group
                    for t in (state.carparks[d.carpark].tiles if d.carpark in state.carparks else ())]
+        load: dict[Pos, int] = {}
         _add_routes(state, graph, group, sources, load)
-    return load
+        for p, n in load.items():
+            out.setdefault(p, {})[group] = n
+    return out
 
 
 def _add_routes(state: State, graph: RoadGraph, group: int, sources: list[Pos], load: dict[Pos, int]):

@@ -10,8 +10,8 @@ from bot import Bot  # noqa: E402
 from game import (EDIT_ALREADY_EXISTS, EDIT_SUCCESS, Carpark, Content, Destination, House, State, Terrain,  # noqa: E402
                   direction_between, join_roundabouts)
 from planner import (Board, Network, RoadGraph, dead_ends, group_roots, junctions_by_load,  # noqa: E402
-                     plan_bypass, plan_destination, plan_house, plan_shortcut, redundant_tiles, route_loads,
-                     unfed_destinations)
+                     plan_bypass, plan_destination, plan_house, plan_shortcut, redundant_tiles, route_colours,
+                     route_loads, unfed_destinations)
 
 N, E, S, W = 0, 2, 4, 6
 
@@ -322,6 +322,30 @@ class TrafficTests(unittest.TestCase):
         plan = plan_house(Board(st, m.terrain), house, net, group_roots(st, net), 0, 0)
         self.assertNotIn((8, 8), plan.tiles[-1:])  # never ends on the roundabout's free north side
         self.assertNotEqual(plan.tiles[-1], (8, 9))
+
+
+    def test_house_keeps_off_another_colours_road(self):
+        # Colour 0's trunk runs along row 9; colour 1's road comes down column 5 and meets it. A new
+        # colour 1 house just above the trunk would ride colour 0's road for free, but one new tile
+        # takes it straight to its own colour's road instead.
+        m = Map()
+        m.destination(*DEST_EAST)
+        m.link((9, 9), (10, 9))
+        m.road(*[(x, 9) for x in range(9, 1, -1)])
+        m.house((2, 10), N)
+        m.link((2, 10), (2, 9))
+        m.destination([(4, 1), (5, 1), (4, 2), (5, 2)], [(4, 3), (5, 3)], (5, 4), N, group=1)
+        m.road(*[(5, y) for y in range(4, 10)])
+        house = m.house((8, 7), N, group=1)
+        st = m.state()
+        net = Network(st)
+        colours = route_colours(st)
+        shared = [p for p, by_colour in colours.items() if 0 in by_colour]
+        plain = plan_house(Board(st, m.terrain), house, net, group_roots(st, net), 0, 0)
+        self.assertTrue(set(plain.tiles) & set(shared))  # without the colour cost it rides colour 0's road
+        plan = plan_house(Board(st, m.terrain, colours=colours), house, net, group_roots(st, net), 0, 0)
+        self.assertEqual(set(plan.tiles) & set(shared), set())
+        self.assertEqual(plan.new_tiles, 1)
 
 
 if __name__ == "__main__":

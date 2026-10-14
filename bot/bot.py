@@ -20,7 +20,7 @@ from game import (EDIT_ALREADY_EXISTS, EDIT_RESULT_NAMES, EDIT_SKIPPED, EDIT_SUC
 from mmbridge import Bridge, BridgeError
 from planner import (MAX_DETOUR_LOOP, Board, Network, RoadGraph, dead_ends, group_roots, house_spur, is_served,
                      junctions_by_load, plan_bypass, plan_destination, plan_house, plan_shortcut, redundant_tiles,
-                     route_loads, unfed_destinations, unfinished_crossings)
+                     route_colours, unfed_destinations, unfinished_crossings)
 
 log = logging.getLogger("bot")
 
@@ -198,7 +198,8 @@ class Bot:
         if self.repair_crossings(state) or self.reclaim_dead_ends(state):
             return
         graph = RoadGraph(state)
-        load = route_loads(state, graph)
+        colours = route_colours(state, graph)
+        load = {p: sum(by_colour.values()) for p, by_colour in colours.items()}
         if self.place_junction_upgrades(state, load):
             return
         net = Network(state)
@@ -207,7 +208,7 @@ class Bot:
         pressured = {net.find(state.carparks[d.carpark].tiles[0]) for d in self.pressured(state)
                      if d.carpark in state.carparks and state.carparks[d.carpark].tiles}
         refused = {move for move, until in self.refused.items() if until > state.time}
-        board = Board(state, self.s.terrain, refused, load=load)
+        board = Board(state, self.s.terrain, refused, load=load, colours=colours)
         budget = {"concrete": state.available[Upgrade.CONCRETE], "bridges": state.available[Upgrade.BRIDGE],
                   "tunnels": state.available[Upgrade.TUNNEL]}
         plans = []
