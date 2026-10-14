@@ -86,12 +86,20 @@ def _vec(p: Pos) -> dict:
     return {"x": p[0], "y": p[1]}
 
 
+def _value(v, default=None):
+    """A projected value, or default when the game couldn't produce it (null or {"$err": ...})."""
+    if v is None or isinstance(v, dict):
+        return default
+    return v
+
+
 @dataclass
 class House:
     pos: Pos
     group: int
     driveway: int  # direction from the house to its access tile
-    waiting: int  # cars waiting to leave
+    waiting: int  # idle cars at home, ready to be dispatched
+    cars: int = 0  # cars the house owns
 
     @property
     def access(self) -> Pos:
@@ -115,6 +123,20 @@ class Destination:
     carpark: int | None
     overcrowded: bool
     tiles: list[Pos] = field(default_factory=list)
+    unassigned: int = 0  # pins no car has been dispatched to yet (too few cars of the colour)
+    en_route: int = 0  # pins whose car is on its way (slow routes keep this high)
+    served: int = 0  # pins served so far (totalServicedPins); its growth is the arrival rate
+    pin_limit: int = 6  # more pins than this and the overcrowd timer runs (9 once upgraded)
+    overcrowd_time: float = 0.0  # the overcrowd timer; the game is lost past max_overcrowd_time
+    max_overcrowd_time: float | None = None
+
+    @property
+    def pressure(self) -> float:
+        """Pins as a share of the limit, plus how far the overcrowd timer has run."""
+        p = (self.unassigned + self.en_route) / max(1, self.pin_limit)
+        if self.max_overcrowd_time:
+            p += self.overcrowd_time / self.max_overcrowd_time
+        return p
 
 
 @dataclass
@@ -143,6 +165,8 @@ class State:
     score: int
     ended: bool
     playable: frozenset[Pos]  # tiles inside the current (growing) city limits
+    roundabouts: set[Pos] = field(default_factory=set)
+    traffic_lights: set[Pos] = field(default_factory=set)
 
     def in_playable(self, p: Pos) -> bool:
         return p in self.playable
@@ -153,6 +177,14 @@ class State:
     def road_toward(self, p: Pos, d: int) -> bool:
         r = self.roads.get(p)
         return bool(r and r[d])
+
+    def joined(self, p: Pos, d: int) -> bool:
+        """Road runs from p to its neighbour in direction d (both sides pointing at each other)."""
+        return self.road_toward(p, d) and self.road_toward(neighbor(p, d), opposite(d))
+
+    def links(self, p: Pos) -> int:
+        """Roads actually joined to p."""
+        return sum(1 for d in range(8) if self.joined(p, d))
 
 
 class Session:
@@ -253,11 +285,16 @@ class Session:
         "y": "key.m_Y",
         "ct": "value._tile.ContentType",
         "r": "value._tile._twoLaneRoadState.*",
+        "ra": "value._tile._isCenterOfRoundabout",
+        "tl": "value._tile._hasTrafficLight",
         "h": ["value._tile.ContentModel", "?HouseModel",
-              {"g": "GroupIndex", "d": "DrivewayDirection", "w": "waitingVehicles._size"}],
+              {"g": "GroupIndex", "d": "DrivewayDirection", "w": "waitingVehicles._size",
+               "c": "ownedVehicles._size"}],
         "d": ["value._tile.ContentModel", "?DestinationModel",
               {"obj": [], "g": "GroupIndex", "a": "isActive", "w": "TotalDemand", "cp": "Carpark",
-               "o": "IsOvercrowding"}],
+               "o": "IsOvercrowding", "ua": "unassignedDemand._size", "er": "waitingDemand._size",
+               "sp": "totalServicedPins", "lim": "MaximumDemandBeforeTimerStarts",
+               "ot": "CurrentFrame._overcrowdingTime", "mot": "_constants.MaxOvercrowdTime"}],
         "p": ["value._tile.ContentModel", "?CarparkModel",
               {"obj": [], "tl": "entranceAtTopLeft", "br": "entranceAtBottomRight",
                "tlc": "TopLeftDrivewayTileCoordinates", "tld": "TopLeftDrivewayDirection",
@@ -283,19 +320,29 @@ class Session:
         playable = self._playable_tiles(clock["expansion"])
 
         roads, content, houses = {}, {}, []
+        roundabouts, lights = set(), set()
         destinations: dict[int, Destination] = {}
         carparks: dict[int, Carpark] = {}
         for t in tiles:
             p = (t["x"], t["y"])
             roads[p] = t["r"] or [0] * 8
             content[p] = Content(t["ct"])
+            if _value(t.get("ra")):
+                roundabouts.add(p)
+            if _value(t.get("tl")):
+                lights.add(p)
             if t["h"]:
-                houses.append(House(p, t["h"]["g"], t["h"]["d"], t["h"]["w"]))
+                houses.append(House(p, t["h"]["g"], t["h"]["d"], t["h"]["w"], _value(t["h"].get("c"), 0)))
             if t["d"]:
-                key = t["d"]["obj"]["$p"]
+                d = t["d"]
+                key = d["obj"]["$p"]
                 dest = destinations.setdefault(key, Destination(
-                    key, t["d"]["g"], bool(t["d"]["a"]), t["d"]["w"],
-                    t["d"]["cp"]["$p"] if t["d"]["cp"] else None, bool(t["d"]["o"])))
+                    key, d["g"], bool(d["a"]), d["w"], d["cp"]["$p"] if d["cp"] else None, bool(d["o"]),
+                    unassigned=_value(d.get("ua"), 0), en_route=_value(d.get("er"), 0),
+                    served=_value(d.get("sp"), 0), pin_limit=_value(d.get("lim"), 6),
+                    overcrowd_time=float(_value(d.get("ot"), 0.0)), max_overcrowd_time=_value(d.get("mot"))))
+                if _value(d.get("ua")) is None:
+                    dest.unassigned = dest.waiting  # split unreadable: count every pin as unassigned
                 dest.tiles.append(p)
             if t["p"]:
                 key = t["p"]["obj"]["$p"]
@@ -308,7 +355,7 @@ class Session:
                         cp.entrances.append((_pos(t["p"]["brc"]), t["p"]["brd"]))
         return State(roads, content, houses, destinations, carparks, upgrades["available"], upgrades["pending"],
                      clock["week"], clock["day"], clock["hour"], clock["time"], clock["expansion"],
-                     bool(clock["paused"]), score, bool(ended), playable)
+                     bool(clock["paused"]), score, bool(ended), playable, roundabouts, lights)
 
     def _playable_tiles(self, expansion_time: float) -> frozenset[Pos]:
         """The game's own IsTileInPlayableArea, re-evaluated only when the city limits move."""
@@ -374,6 +421,22 @@ class Session:
                     raise r
         return codes
 
+    def add_junction_upgrade(self, kind: Upgrade, p: Pos) -> int:
+        """Put a roundabout or a traffic light on a junction tile, the way the game's own tools do:
+        TileEditor.AddRoundabout / AddTrafficLight(ITilemap, Vector2Int) validate it, and the
+        resulting edit is scheduled as an EditTileCommand. Returns the TileEditResultCode."""
+        method = {Upgrade.ROUNDABOUT: "AddRoundabout", Upgrade.TRAFFIC_LIGHT: "AddTrafficLight"}[kind]
+        h = self.h
+        try:
+            result = self.b.call(h["editor"], method, h["tilemap"], _vec(p))
+        except BridgeError:
+            return -1
+        code = result["resultCode"]
+        if code == EDIT_SUCCESS and result["edit"]:
+            command = nested_call(EDIT_TILE_COMMAND, "Create", h["scope"], result["edit"])
+            self.b.call(h["sim"], "ScheduleCommand", command)
+        return code
+
     def clear_tiles(self, tiles: list[Pos], sequential: bool = False) -> list[int]:
         """Remove the roads on tiles with TileEditor.ClearTile (as the eraser does); their road
         tiles go back to the inventory. Returns a TileEditResultCode per tile.
@@ -421,6 +484,28 @@ class Session:
                 if isinstance(r, Exception):
                     raise r
         return codes
+
+    TIME_SCALE = {"$class": "TimeScale"}
+    TIME_SCALES = ("SingleSlow", "Single", "DoubleSlow", "Double", "ExtraFast")
+
+    def game_speed(self) -> float:
+        """The game's own speed (the play / fast-forward buttons' TimeScale) times its developer
+        DebugTimescale multiplier."""
+        scale = self.b.call(self.h["game"], "GetTimeScale", then=["_scale"])
+        debug = self.b.get(self.h["game"], "_debugTimescale")
+        return scale * (debug or 1.0)
+
+    def set_game_speed(self, speed: float) -> float:
+        """Run the game `speed` times faster: the fastest of the game's own speeds (Game.SetTimeScale
+        takes one of the TimeScale instances, as the fast-forward buttons do) that doesn't overshoot,
+        and the rest through MotorwaysGame.DebugTimescale, the multiplier the developer tools use.
+        Returns the speed asked of the game."""
+        # TimeScale.FromScale returns Single for any value (it maps nothing), and SetTimeScale with the
+        # ExtraFast instance only reached 2.9x, so leave the TimeScale alone and scale the rest with
+        # _debugTimescale, which measured exactly 4.0x when set to 4.
+        scale = self.b.call(self.h["game"], "GetTimeScale", then=["_scale"]) or 1.0
+        self.b.set(self.h["game"], "_debugTimescale", float(speed / scale))
+        return speed
 
     def upgrade_choices(self) -> list[dict]:
         """Packages offered by the first pending choice: {type, amount, additionalConcrete}."""

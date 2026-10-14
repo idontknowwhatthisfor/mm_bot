@@ -6,11 +6,13 @@ import unittest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
-from game import Carpark, Content, Destination, House, State, Terrain, direction_between  # noqa: E402
-from planner import (Board, Network, RoadGraph, dead_ends, group_roots, plan_house, plan_shortcut,  # noqa: E402
-                     redundant_tiles)
+from bot import Bot  # noqa: E402
+from game import (EDIT_ALREADY_EXISTS, EDIT_SUCCESS, Carpark, Content, Destination, House, State, Terrain,  # noqa: E402
+                  direction_between)
+from planner import (Board, Network, RoadGraph, dead_ends, group_roots, junctions_by_load,  # noqa: E402
+                     plan_bypass, plan_destination, plan_house, plan_shortcut, redundant_tiles, route_loads)
 
-W, S = 6, 4
+N, E, S, W = 0, 2, 4, 6
 
 
 class Map:
@@ -46,6 +48,7 @@ class Map:
         self.carparks[key] = Carpark(key, list(park_tiles), [(entrance, entrance_dir)])
         self.destinations[key] = Destination(key, group, True, 0, key, False, list(tiles))
         self.roads.setdefault(park_tiles[0], [0] * 8)[entrance_dir] = 8  # the car park's stub
+        return self.destinations[key]
 
     def state(self):
         return State(dict(self.roads), dict(self.content), list(self.houses), dict(self.destinations),
@@ -155,6 +158,134 @@ class RoadLengthTests(unittest.TestCase):
         order = dead_ends(m.state(), m.terrain)
         self.assertEqual(sorted(order), [(4, 11), (4, 12), (5, 11)])
         self.assertNotEqual(order[0], (4, 11))  # cleared from a loose end, never the middle first
+
+
+
+DEST_EAST = ([(10, 10), (11, 10), (10, 11), (11, 11)], [(10, 9), (11, 9)], (9, 9), W)
+
+
+class TrafficTests(unittest.TestCase):
+    def test_route_loads_count_houses_downstream(self):
+        m = Map()
+        m.destination(*DEST_EAST)
+        m.link((9, 9), (10, 9))
+        m.road(*[(x, 9) for x in range(9, 2, -1)])
+        m.house((3, 10), S)
+        m.link((3, 10), (3, 9))
+        m.house((6, 10), S)
+        m.link((6, 10), (6, 9))
+        m.road((6, 9), (6, 8))  # a side road nobody uses
+        st = m.state()
+        load = route_loads(st)
+        self.assertEqual(load[(4, 9)], 1)
+        self.assertEqual(load[(7, 9)], 2)
+        self.assertEqual(load[(9, 9)], 2)
+        self.assertNotIn((6, 8), load)
+        self.assertEqual(junctions_by_load(st, load, 2), [(6, 9)])  # house, side road and trunk meet there
+        st.roundabouts.add((6, 9))
+        self.assertEqual(junctions_by_load(st, load, 2), [])
+
+    def _two_networks(self):
+        m = Map()
+        m.destination(*DEST_EAST)
+        m.link((9, 9), (10, 9))
+        m.road((9, 9), (8, 9), (7, 9), (6, 9))
+        m.destination([(2, 10), (3, 10), (2, 11), (3, 11)], [(3, 9), (2, 9)], (4, 9), E)
+        m.link((4, 9), (3, 9))
+        m.road((4, 9), (4, 8), (4, 7))
+        house = m.house((8, 6), N)
+        st = m.state()
+        net = Network(st)
+        return st, m, house, net, group_roots(st, net)
+
+    def test_house_joins_nearest_network_normally(self):
+        st, m, house, net, roots = self._two_networks()
+        plan = plan_house(Board(st, m.terrain), house, net, roots, 0, 0)
+        self.assertEqual(net.find(plan.tiles[-1]), net.find((9, 9)))
+        self.assertEqual(plan.new_tiles, 1)
+
+    def test_house_prefers_network_of_destination_under_pressure(self):
+        st, m, house, net, roots = self._two_networks()
+        plan = plan_house(Board(st, m.terrain), house, net, roots, 0, 0, pressured={net.find((3, 9))})
+        self.assertEqual(net.find(plan.tiles[-1]), net.find((3, 9)))
+        self.assertEqual(plan.new_tiles, 2)
+
+    def test_house_avoids_joining_a_busy_trunk(self):
+        st, m, house, net, roots = self._two_networks()
+        busy = {(x, 9): 20 for x in range(6, 10)}
+        plan = plan_house(Board(st, m.terrain, load=busy), house, net, roots, 0, 0)
+        self.assertEqual(net.find(plan.tiles[-1]), net.find((3, 9)))  # one extra tile beats 14 extra houses
+
+    def test_bypass_for_a_destination_reached_the_long_way_round(self):
+        m = Map()
+        dest = m.destination(*DEST_EAST)
+        m.link((9, 9), (10, 9))
+        m.road(*[(x, 9) for x in range(9, 1, -1)], *[(2, y) for y in range(10, 15)],
+               *[(x, 15) for x in range(3, 9)])
+        m.house((8, 14), N)
+        m.link((8, 14), (8, 15))
+        st = m.state()
+        plan = plan_bypass(Board(st, m.terrain), dest, 0, 0)
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan.tiles[0], (9, 9))
+        self.assertLessEqual(plan.new_tiles, 5)  # up the east side instead of 19 tiles round the west
+        self.assertEqual(plan.tiles[-1], (8, 15))  # where it saves the most trip
+
+    def test_no_bypass_to_road_no_house_drives_on(self):
+        # Same long loop, but the only house sits by the car park: a bypass would shorten nobody's
+        # trip, and the loop-clearing pass would just remove it again.
+        m = Map()
+        dest = m.destination(*DEST_EAST)
+        m.link((9, 9), (10, 9))
+        m.road(*[(x, 9) for x in range(9, 1, -1)], *[(2, y) for y in range(10, 15)],
+               *[(x, 15) for x in range(3, 9)])
+        m.house((8, 10), S)
+        m.link((8, 10), (8, 9))
+        self.assertIsNone(plan_bypass(Board(m.state(), m.terrain), dest, 0, 0))
+
+    def test_entering_water_needs_a_bridge_unless_the_deck_starts_there(self):
+        m = Map()
+        m.destination(*DEST_EAST)
+        m.link((9, 9), (10, 9))
+        for y in range(16):
+            for x in (5, 6, 7):
+                m.terrain[(x, y)] = Terrain(False, True, False, False)  # a river three tiles wide
+        m.road((4, 9), (3, 9))
+        house = m.house((3, 10), S)
+        m.link((3, 10), (3, 9))
+        # A half-built deck: only the far water tile has road, so entering from the west needs stock.
+        m.road((7, 9), (8, 9), (9, 9))
+        st = m.state()
+        net = Network(st)
+        self.assertIsNone(plan_house(Board(st, m.terrain), house, net, group_roots(st, net), 0, 0))
+        plan = plan_house(Board(st, m.terrain), house, net, group_roots(st, net), 1, 0)
+        self.assertEqual(plan.crossings, 1)
+
+    def test_crossing_an_existing_bridge_sends_only_the_new_segments(self):
+        # The game refuses a segment it already has when it lands on a bridge deck (CannotCreateBridge),
+        # so a road that runs over an existing bridge must leave the bridge's segments alone.
+        m = Map()
+        dest = m.destination(*DEST_EAST)
+        for y in range(16):
+            for x in (5, 6, 7):
+                m.terrain[(x, y)] = Terrain(False, True, False, False)
+        m.road(*[(x, 9) for x in range(4, 9)])  # another network's bridge, (5, 9) to (7, 9)
+        m.house((2, 9), E)
+        st = m.state()
+        plan = plan_destination(Board(st, m.terrain), dest, Network(st), 0, 0)
+        self.assertIn(((6, 9), W), plan.segments)  # the road runs over the bridge
+        sent = []
+
+        class FakeSession:
+            def add_roads(self, segments, sequential=False):
+                sent.extend(segments)
+                return [EDIT_SUCCESS] * len(segments)
+
+        codes = Bot(FakeSession()).draw(st, plan.segments, sequential=True)
+        self.assertTrue(sent)
+        self.assertEqual([seg for seg in sent if st.joined(*seg)], [])
+        self.assertEqual(codes.count(EDIT_ALREADY_EXISTS), len(plan.segments) - len(sent))
+        self.assertEqual(codes.count(EDIT_SUCCESS), len(sent))
 
 
 if __name__ == "__main__":

@@ -1,1 +1,10 @@
 bot/__pycache__/
+__pycache__/
+*.pyc
+*.orig
+*.log
+*.diff
+.DS_Store
+bot/.mmbridge_token
+bot.backup-2026-10-14/
+bot.baseline/

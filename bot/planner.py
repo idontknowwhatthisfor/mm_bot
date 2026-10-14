@@ -24,13 +24,30 @@ BLOCKING = {Content.HOUSE, Content.DESTINATION, Content.CARPARK, Content.BOAT_TE
 COST_EMPTY = 1.0
 COST_TREE = 1.05  # building over a tree clears it; same tile cost
 COST_EXISTING_ROAD = 0.1  # road that exists costs no tiles, but cutting across other networks adds junctions
-COST_TURN = 0.01  # per 45° of turning: among equal-length roads, prefer straight ones
+# Cost of a bend, by its size in 45° steps. Cars slow down for 90° (and sharper) turns but not for
+# 45° bends, so a right angle costs a good fraction of a tile while a diagonal bend is just a tie-break.
+TURN_COST = (0.0, 0.01, 0.3)
 COST_TURN_HOUSE = 0.05  # turning a house is free in the game, but don't churn for nothing
 COST_BRIDGE = 4.0  # on top of the tiles it spans; bridges are scarce
 MAX_CROSSING = 5
 MAX_TURN = 2  # in 45° steps: no road bends sharper than a right angle
 # Tie-break between equally short roads: join the network nearer the destination.
 COST_REMAINING_TRIP = 0.01
+# Cars never route around traffic: every car of a colour takes the same free-flow route, so a trunk
+# carrying many houses jams. Road carrying more than LOAD_FREE houses costs COST_LOAD per extra house
+# to drive along or join, so new houses get their own way in rather than piling onto the busiest road.
+LOAD_FREE = 6
+COST_LOAD = 0.15
+# Joining a road where it would become a junction slows every car through it.
+COST_JUNCTION = 0.2
+# A house of a colour with a destination close to overcrowding will spend up to this many extra
+# tiles to join that destination's network instead of another one of its colour.
+COST_OTHER_NETWORK = 3.0
+# A bypass (new road from a car park entrance straight to a far part of its network) must shorten
+# some trip by at least this many tiles.
+MIN_BYPASS_SAVING = 4
+# Among bypasses, one more new tile is worth it for every two tiles it takes off the trip.
+COST_BYPASS_TRIP = 0.5
 # Optimising existing roads may lengthen a house's trip by at most this many tiles.
 MAX_DETOUR_SHORTCUT = 2
 MAX_DETOUR_LOOP = 1
@@ -91,12 +108,26 @@ class Board:
     refused: set[tuple[Pos, int]] = field(default_factory=set)  # moves the game recently rejected
     planned: dict[Pos, int] = field(default_factory=dict)  # tile -> colour whose network it joins
     planned_corners: set[frozenset] = field(default_factory=set)  # corners crossed by planned diagonals
+    load: dict[Pos, int] = field(default_factory=dict)  # houses whose route uses each road tile
+    # When set, the only existing road tiles a search may step on (for roads that must be all new).
+    road_allowed: set[Pos] | None = None
 
     def is_road(self, p: Pos) -> bool:
         return self.state.has_road(p) or p in self.planned
 
+    def load_cost(self, p: Pos) -> float:
+        return COST_LOAD * max(0, self.load.get(p, 0) - LOAD_FREE)
+
+    def join_cost(self, p: Pos) -> float:
+        """Extra cost of ending a new road on an existing road tile: its traffic, and a new junction."""
+        if not self.state.has_road(p):
+            return 0.0
+        return self.load_cost(p) + (COST_JUNCTION if self.state.links(p) >= 2 else 0.0)
+
     def passable(self, p: Pos) -> bool:
         if not self.state.in_playable(p):
+            return False
+        if self.road_allowed is not None and self.is_road(p) and p not in self.road_allowed:
             return False
         t = self.terrain.get(p)
         if t is None or not t.driveable:
@@ -112,7 +143,7 @@ class Board:
 
     def step_cost(self, p: Pos) -> float:
         if self.is_road(p):
-            return COST_EXISTING_ROAD
+            return COST_EXISTING_ROAD + self.load_cost(p)
         if self.state.content.get(p) == Content.TREE:
             return COST_TREE
         return COST_EMPTY
@@ -158,12 +189,12 @@ def is_served(house: House, net: Network, roots: dict[int, set[Pos]]) -> bool:
     return net.find(house.pos) in roots.get(house.group, set())
 
 
-def entrances_for(state: State, group: int) -> list[tuple[Pos, Pos, int]]:
+def entrances_for(state: State, group: int, only: Destination | None = None) -> list[tuple[Pos, Pos, int]]:
     """(outside tile, car park tile, direction outside->car park) for active destinations of a colour."""
     out = []
     for dest in state.destinations.values():
         cp = state.carparks.get(dest.carpark)
-        if not (dest.active and dest.group == group and cp):
+        if not (dest.active and dest.group == group and cp) or (only is not None and dest.key != only.key):
             continue
         for outside, d in cp.entrances:
             out.append((outside, neighbor(outside, opposite(d)), opposite(d)))
@@ -214,7 +245,7 @@ def search(board: Board, starts: list[Start], is_goal, bridges: int, tunnels: in
             if bend > MAX_TURN or not board.move_allowed(p, d):
                 continue
             q = neighbor(p, d)
-            base = cost + bend * COST_TURN
+            base = cost + TURN_COST[bend]
             if board.passable(q):
                 relax(key, (q, d), [], base + board.step_cost(q), used[key])
                 continue
@@ -233,7 +264,9 @@ def search(board: Board, starts: list[Start], is_goal, bridges: int, tunnels: in
                 roads = [board.state.roads.get(t) for t in spanned]
                 if any(r and any(r) and not (r[d] or r[opposite(d)]) for r in roads):
                     continue  # another crossing runs across this one
-                started = any(r and any(r) for r in roads)  # finishing a deck needs no new bridge
+                # Stepping onto water takes a bridge from stock unless that first water tile already
+                # has road (joining a deck that exists); further deck tiles never need one.
+                started = bool(roads[0] and any(roads[0]))
                 if not started and used[key] >= budget:
                     continue
                 span_cost = sum(COST_EXISTING_ROAD if r and any(r) else COST_EMPTY for r in roads)
@@ -275,12 +308,22 @@ def _house_starts(board: Board, house: House) -> list[Start]:
 # Plans --------------------------------------------------------------------------------------
 
 def plan_house(board: Board, house: House, net: Network, roots: dict[int, set[Pos]],
-               bridges: int, tunnels: int) -> Plan | None:
+               bridges: int, tunnels: int, pressured: set[Pos] = frozenset()) -> Plan | None:
     """Shortest road from a house (turned to whichever side is best) to its colour's network or
-    to a car park entrance of its colour."""
+    to a car park entrance of its colour. With pressured (network roots holding a destination close
+    to overcrowding), joining one of those networks is preferred by up to COST_OTHER_NETWORK tiles,
+    since cars only reach destinations on their own network."""
     state = board.state
     goal_roots = roots.get(house.group, set())
     entrances = {outside: d for outside, _, d in entrances_for(state, house.group)}
+    prefer = goal_roots & set(pressured)
+    entrance_root = {outside: net.find(park) for outside, park, _ in entrances_for(state, house.group)}
+
+    def network_cost(p: Pos) -> float:
+        if not prefer:
+            return 0.0
+        root = entrance_root[p] if p in entrances else net.find(p)
+        return 0.0 if root in prefer else COST_OTHER_NETWORK
 
     def on_network(p: Pos) -> bool:
         if board.planned.get(p) == house.group:
@@ -290,7 +333,10 @@ def plan_house(board: Board, house: House, net: Network, roots: dict[int, set[Po
     trips = trip_lengths(state, house.group)
 
     def remaining_trip(p: Pos) -> float:
-        return 0.0 if p in entrances else COST_REMAINING_TRIP * trips.get(p, 0)
+        if board.planned.get(p) == house.group and not state.has_road(p):
+            return 0.0
+        trip = 0.0 if p in entrances else COST_REMAINING_TRIP * trips.get(p, 0)
+        return trip + board.join_cost(p) + network_cost(p)
 
     found = search(board, _house_starts(board, house), lambda p: on_network(p) or p in entrances,
                    bridges, tunnels, goal_cost=remaining_trip)
@@ -354,11 +400,12 @@ def plan_destination(board: Board, dest: Destination, net: Network, bridges: int
 
 # Network upkeep -----------------------------------------------------------------------------
 
-def trip_lengths(state: State, group: int) -> dict[Pos, int]:
-    """Tiles of existing road to drive from each road tile to an active car park of a colour."""
+def trip_lengths(state: State, group: int, dest: Destination | None = None) -> dict[Pos, int]:
+    """Tiles of existing road to drive from each road tile to an active car park of a colour
+    (or to one destination's car park)."""
     frontier = []
     dist: dict[Pos, int] = {}
-    for outside, park, _ in entrances_for(state, group):
+    for outside, park, _ in entrances_for(state, group, dest):
         for t in (outside, park):
             if state.has_road(t) and t not in dist:
                 dist[t] = 0
@@ -664,3 +711,94 @@ def plan_shortcut(state: State, terrain: dict[Pos, Terrain], house: House, refus
     plan.new_tiles = real_new
     plan.saves = freed - real_new
     return plan
+
+
+# Traffic ------------------------------------------------------------------------------------
+
+def route_loads(state: State, graph: RoadGraph | None = None) -> dict[Pos, int]:
+    """For each road tile, how many houses drive over it on their way to the nearest destination
+    of their colour. The game routes every car along the free-flow shortest road and never around
+    traffic, so this is where the cars actually go (shortest by tiles, as an approximation)."""
+    graph = graph or RoadGraph(state)
+    load: dict[Pos, int] = {}
+    for group in {h.group for h in state.houses}:
+        sources = [t for d in state.destinations.values() if d.active and d.group == group
+                   for t in (state.carparks[d.carpark].tiles if d.carpark in state.carparks else ())]
+        _add_routes(state, graph, group, sources, load)
+    return load
+
+
+def _add_routes(state: State, graph: RoadGraph, group: int, sources: list[Pos], load: dict[Pos, int]):
+    """Count, on each road tile, the houses of a colour whose shortest road to the sources uses it."""
+    stops = graph.endpoints()
+    parent: dict[Pos, Pos | None] = {s: None for s in sources}
+    frontier = list(sources)
+    while frontier:
+        nxt = []
+        for p in frontier:
+            if p in stops and parent[p] is not None:
+                continue
+            for q in graph.adj.get(p, ()):
+                if q not in parent:
+                    parent[q] = p
+                    nxt.append(q)
+        frontier = nxt
+    for h in state.houses:
+        if h.group != group or h.pos not in parent:
+            continue
+        p = parent[h.pos]
+        while p is not None and parent[p] is not None:
+            load[p] = load.get(p, 0) + 1
+            p = parent[p]
+
+
+def junctions_by_load(state: State, load: dict[Pos, int], min_load: int) -> list[Pos]:
+    """Junction tiles (three or more roads meet) carrying at least min_load houses, busiest first.
+    Those are where a roundabout or traffic light helps."""
+    out = []
+    for p, n in load.items():
+        if n < min_load or state.links(p) < 3 or state.content.get(p, Content.NONE) != Content.NONE:
+            continue
+        if p in state.roundabouts or p in state.traffic_lights:
+            continue
+        out.append((n, p))
+    return [p for _, p in sorted(out, reverse=True)]
+
+
+def plan_bypass(board: Board, dest: Destination, bridges: int, tunnels: int) -> Plan | None:
+    """A new road from a destination's car park entrance straight to a far part of its network,
+    for a destination whose cars take too long to arrive. All the new road is fresh tiles; it ends
+    on an existing road tile that houses drive through on their way to this destination, and
+    shortens their trip by MIN_BYPASS_SAVING or more. (Ending anywhere else would shorten nobody's
+    trip, and the loop-clearing pass would take it straight back down.)"""
+    state = board.state
+    trips = trip_lengths(state, dest.group, dest)
+    on_route: dict[Pos, int] = {}
+    cp = state.carparks.get(dest.carpark)
+    if cp:
+        _add_routes(state, RoadGraph(state), dest.group, cp.tiles, on_route)
+    starts = [(outside, opposite(into), 0.0) for outside, _, into in entrances_for(state, dest.group, dest)
+              if state.has_road(outside)]
+    if not starts or not trips:
+        return None
+
+    def tiles_apart(a: Pos, b: Pos) -> int:
+        return max(abs(a[0] - b[0]), abs(a[1] - b[1]))  # a diagonal step is one tile, like a straight one
+
+    goals = {p for p, t in trips.items()
+             if p in on_route and state.content.get(p) not in BLOCKING
+             and t - min(tiles_apart(p, s[0]) for s in starts) >= MIN_BYPASS_SAVING}
+    if not goals:
+        return None
+    longest = max(trips[p] for p in goals)
+    fresh = replace(board, road_allowed=goals | {s[0] for s in starts})
+    found = search(fresh, starts, lambda p: p in goals, bridges, tunnels,
+                   goal_cost=lambda p: COST_BYPASS_TRIP * (longest - trips[p]))
+    if found is None:
+        return None
+    path, crossings = found
+    saving = trips[path[-1]] - (len(path) - 1)
+    if saving < MIN_BYPASS_SAVING or len(path) < 3:
+        return None
+    return Plan(f"bypass to destination {dest.tiles[0]}", ("bypass", dest.key), dest.group, _road_segments(path),
+                path, _new_tiles(board, path), crossings, saves=0)
