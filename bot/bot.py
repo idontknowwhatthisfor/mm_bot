@@ -15,10 +15,10 @@ import logging
 import time
 from collections import Counter
 
-from game import EDIT_ALREADY_EXISTS, EDIT_RESULT_NAMES, EDIT_SUCCESS, GameMode, Session, State, Upgrade
+from game import EDIT_ALREADY_EXISTS, EDIT_RESULT_NAMES, EDIT_SKIPPED, EDIT_SUCCESS, GameMode, Session, State, Upgrade
 from mmbridge import Bridge, BridgeError
-from planner import (Board, Network, group_roots, is_served, plan_destination, plan_house, unfed_destinations,
-                     unfinished_crossings)
+from planner import (Board, Network, RoadGraph, dead_ends, group_roots, house_spur, is_served, plan_destination,
+                     plan_house, plan_shortcut, redundant_tiles, unfed_destinations, unfinished_crossings)
 
 log = logging.getLogger("bot")
 
@@ -35,6 +35,12 @@ UPGRADE_VALUE = {
 WATER_CROSSING_VALUE = 8.0
 GIVE_UP_AFTER = 5  # failed attempts before a house is left alone for a while
 GIVE_UP_FOR = 20.0  # sim seconds
+REMEMBER_REFUSED_FOR = 60.0  # sim seconds a move the game refused is kept out of plans
+# Refusals that say nothing about the move itself (out of stock, already there, not tried).
+NOT_ABOUT_THE_MOVE = {-2, -1, 5, 6, 7, 13}
+DIRECTION_NAMES = "N NE E SE S SW W NW".split()
+OPTIMISE_EVERY = 5.0  # sim seconds between passes that shorten roads already built
+SHORTCUT_CANDIDATES = 12  # houses with the longest private roads considered per pass
 
 
 class Bot:
@@ -44,6 +50,8 @@ class Bot:
         self.last_build_time: float | None = None
         self.failures: Counter = Counter()
         self.skip_until: dict = {}
+        self.refused: dict = {}  # (tile, direction) -> sim time until which it is avoided
+        self.next_optimise = 0.0
         self.game_key = None
         self.last_report_day = None
         self.picked_at: float | None = None  # when the last upgrade was picked (monotonic)
@@ -81,6 +89,8 @@ class Bot:
         self.last_build_time = None
         self.failures.clear()
         self.skip_until.clear()
+        self.refused.clear()
+        self.next_optimise = 0.0
         water = any(t.water for t in self.s.terrain.values())
         mountains = any(t.mountain for t in self.s.terrain.values())
         self.values = dict(UPGRADE_VALUE)
@@ -112,11 +122,13 @@ class Bot:
     # Roads ---------------------------------------------------------------------------------
 
     def build(self, state: State):
-        if self.repair_crossings(state):
-            return  # re-read the map before planning on top of the repaired network
+        # Each upkeep step changes the map, so plan only on a fresh read afterwards.
+        if self.repair_crossings(state) or self.reclaim_dead_ends(state):
+            return
         net = Network(state)
         roots = group_roots(state, net)
-        board = Board(state, self.s.terrain)
+        refused = {move for move, until in self.refused.items() if until > state.time}
+        board = Board(state, self.s.terrain, refused)
         budget = {"concrete": state.available[Upgrade.CONCRETE], "bridges": state.available[Upgrade.BRIDGE],
                   "tunnels": state.available[Upgrade.TUNNEL]}
         plans = []
@@ -126,8 +138,7 @@ class Bot:
                 return
             budget["concrete"] -= plan.new_tiles
             budget["bridges"] -= plan.crossings  # conservative: count any crossing against bridges
-            for t in plan.tiles:
-                board.planned[t] = plan.group
+            board.claim(plan)
             plans.append(plan)
 
         # A destination with no houses of its colour on its network gets no cars and will overflow,
@@ -139,15 +150,13 @@ class Bot:
         for house in sorted(unserved, key=lambda h: -h.waiting):
             take(plan_house(board, house, net, roots, budget["bridges"], budget["tunnels"]))
         if not plans:
+            self.optimise(state, refused)
             return
 
         # Plain roads go out in one batch. A road over water or through a mountain is drawn one
         # tile at a time (each segment must exist before the next validates), one per tick.
-        def crosses(plan):
-            return any(not self.s.terrain[t].driveable for t in plan.tiles if t in self.s.terrain)
-
-        plain = [plan for plan in plans if not crosses(plan)]
-        crossing = [plan for plan in plans if crosses(plan)][:1]
+        plain = [plan for plan in plans if not self.crosses(plan)]
+        crossing = [plan for plan in plans if self.crosses(plan)][:1]
         results = []
         codes = self.s.add_roads([seg for plan in plain for seg in plan.segments])
         i = 0
@@ -158,18 +167,72 @@ class Bot:
             results.append((plan, self.s.add_roads(plan.segments, sequential=True)))
         self.last_build_time = state.time
         for plan, mine in results:
-            bad = [c for c in mine if c not in (EDIT_SUCCESS, EDIT_ALREADY_EXISTS)]
-            if bad:
-                self.failures[plan.key] += 1
-                log.info("%s (colour %d): %d/%d segments refused (%s)", plan.label, plan.group, len(bad), len(mine),
-                         ", ".join(sorted({EDIT_RESULT_NAMES.get(c, str(c)) for c in bad})))
-                if self.failures[plan.key] >= GIVE_UP_AFTER:
-                    self.skip_until[plan.key] = state.time + GIVE_UP_FOR
-                    self.failures[plan.key] = 0
-            else:
-                self.failures.pop(plan.key, None)
-                log.info("%s (colour %d): road of %d tiles%s", plan.label, plan.group, len(plan.tiles),
-                         f", {plan.crossings} crossing(s)" if plan.crossings else "")
+            self.record(state, plan, mine)
+
+    def crosses(self, plan) -> bool:
+        return any(not self.s.terrain[t].driveable for t in plan.tiles if t in self.s.terrain)
+
+    def record(self, state: State, plan, mine: list[int]) -> bool:
+        """Log a plan's outcome and remember refused moves. Returns whether it all went through."""
+        bad = [c for c in mine if c not in (EDIT_SUCCESS, EDIT_ALREADY_EXISTS)]
+        for segment, code in zip(plan.segments, mine):
+            if code not in NOT_ABOUT_THE_MOVE and code != EDIT_SUCCESS:
+                self.refused[segment] = state.time + REMEMBER_REFUSED_FOR
+        if bad:
+            self.failures[plan.key] += 1
+            log.info("%s (colour %d): %d/%d segments refused (%s)", plan.label, plan.group, len(bad), len(mine),
+                     ", ".join(sorted({EDIT_RESULT_NAMES.get(c, str(c)) for c in bad})))
+            if self.failures[plan.key] >= GIVE_UP_AFTER:
+                self.skip_until[plan.key] = state.time + GIVE_UP_FOR
+                self.failures[plan.key] = 0
+            return False
+        self.failures.pop(plan.key, None)
+        log.info("%s (colour %d): road of %d tiles (%d new)%s%s%s", plan.label, plan.group, len(plan.tiles),
+                 plan.new_tiles, f", {plan.crossings} crossing(s)" if plan.crossings else "",
+                 ", turned the house" if plan.turned_house else "",
+                 f", frees {plan.saves} old tile(s)" if plan.saves else "")
+        return True
+
+    def optimise(self, state: State, refused: set) -> bool:
+        """Shorten roads already built. First, houses whose private road is longer than a fresh
+        connection would be get reconnected (the old road then dead-ends and is reclaimed). Then
+        loops and doubled connections lose the tiles nobody needs."""
+        if state.time < self.next_optimise:
+            return False
+        self.next_optimise = state.time + OPTIMISE_EVERY
+        terrain = self.s.terrain
+        started = time.monotonic()
+        graph = RoadGraph(state)
+        trips, _ = graph.evaluate()
+        spurs = sorted(((len(house_spur(state, terrain, h, graph)), i, h) for i, h in enumerate(state.houses)),
+                       reverse=True)
+        for length, _, house in spurs[:SHORTCUT_CANDIDATES]:
+            if length == 0:
+                break
+            if self.skip_until.get(("shortcut", house.pos), -1) >= state.time:
+                continue
+            plan = plan_shortcut(state, terrain, house, refused, state.available[Upgrade.BRIDGE],
+                                 state.available[Upgrade.TUNNEL], graph, trips)
+            if plan is None or plan.new_tiles > state.available[Upgrade.CONCRETE]:
+                continue
+            self.record(state, plan, self.s.add_roads(plan.segments, sequential=self.crosses(plan)))
+            self.last_build_time = state.time
+            return True
+
+        tiles = [p for p in redundant_tiles(state, terrain) if self.skip_until.get(("clear", p), -1) < state.time]
+        if time.monotonic() - started > 1.0:
+            log.info("(optimising took %.1fs)", time.monotonic() - started)
+        if not tiles:
+            return False
+        codes = self.s.clear_tiles(tiles, sequential=True)
+        cleared = [p for p, c in zip(tiles, codes) if c == EDIT_SUCCESS]
+        for p, c in zip(tiles, codes):
+            if c not in (EDIT_SUCCESS, EDIT_SKIPPED):
+                self.skip_until[("clear", p)] = state.time + GIVE_UP_FOR
+        if cleared:
+            log.info("removed %d redundant road tile(s) at %s", len(cleared), ", ".join(map(str, cleared)))
+        self.last_build_time = state.time
+        return bool(cleared)
 
     def repair_crossings(self, state: State) -> bool:
         """Finish bridges/tunnels left with a missing segment. Returns whether anything was built."""
@@ -182,18 +245,34 @@ class Bot:
         for seg, code in zip(todo, codes):
             if code in (EDIT_SUCCESS, EDIT_ALREADY_EXISTS):
                 built = True
-                log.info("completed crossing at %s toward %s", seg[0], "N NE E SE S SW W NW".split()[seg[1]])
+                log.info("completed crossing at %s toward %s", seg[0], DIRECTION_NAMES[seg[1]])
             else:
                 self.skip_until[("repair", seg)] = state.time + GIVE_UP_FOR
         self.last_build_time = state.time
         return built
 
+    def reclaim_dead_ends(self, state: State) -> bool:
+        """Clear roads that lead nowhere so their tiles can be used elsewhere."""
+        tiles = [p for p in dead_ends(state, self.s.terrain) if self.skip_until.get(("clear", p), -1) < state.time]
+        if not tiles:
+            return False
+        codes = self.s.clear_tiles(tiles, sequential=True)
+        cleared = [p for p, c in zip(tiles, codes) if c == EDIT_SUCCESS]
+        for p, c in zip(tiles, codes):
+            if c not in (EDIT_SUCCESS, EDIT_SKIPPED):
+                self.skip_until[("clear", p)] = state.time + GIVE_UP_FOR
+        if cleared:
+            log.info("reclaimed %d dead-end road tile(s) at %s", len(cleared), ", ".join(map(str, cleared)))
+        self.last_build_time = state.time
+        return bool(cleared)
+
     # Upgrades ------------------------------------------------------------------------------
 
     def pick_upgrade(self, state: State):
-        # One pick per offered choice: wait until the last one has been applied.
+        # One pick per offered choice: wait until the last one has been applied. A click while the
+        # screen is still animating in is ignored by the game, so retry after a short wait.
         if self.picked_at is not None and state.pending_choices >= self.picked_pending and \
-                time.monotonic() - self.picked_at < 10:
+                time.monotonic() - self.picked_at < 3:
             return
         options = self.s.upgrade_choices()
         if not options:

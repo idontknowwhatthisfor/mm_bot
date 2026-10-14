@@ -29,10 +29,38 @@ bot.py ──► planner.py      which houses reach their colour, cheapest roads
   `DrawRoadAction` takes, so the game enforces its own rules (road tiles, bridges, blocked
   tiles).
 - **Weekly upgrades:** the bot calls the upgrade screen's own `OnUpgradeSelect` handler.
-- **Strategy:** every house whose network doesn't reach an active destination of its colour
-  gets the cheapest connection to that colour's network or to a car park entrance. The search
-  is Dijkstra over the grid; existing roads are cheap to reuse, and straight bridge or tunnel
-  crossings are used when available. Houses with waiting cars go first.
+- **Turning houses:** drawing out of a house toward any of its 8 neighbours turns its
+  driveway, just as dragging a house does in the game: `TileEditor.AddRoad` on the house tile
+  returns an `AlignDrivewayEdit`. Each unconnected house is planned from all 8 sides, and the
+  plan starts by turning the house if another side gives a shorter road.
+- **Strategy:**
+  - Destinations whose car park has no houses of their colour on its network are fed first,
+    since they're what ends a game.
+  - Every house that can't reach its colour gets the connection with the fewest new road
+    tiles, to that colour's network or to a car park entrance. Driveway tiles are free, so
+    turning a house to face an existing road costs nothing.
+  - The search is Dijkstra over (tile, heading). Roads go in 8 directions, and a diagonal costs
+    one tile like a straight step. Bends are capped at 90°, and two diagonals never cross at
+    the same corner.
+  - New tiles dominate the cost. Turns, reused road and trip length only break ties between
+    equally short roads.
+  - Bridges and tunnels are straight crossings, drawn one tile at a time because each piece
+    must exist before the next validates.
+  - Any move the game refuses is avoided for a minute.
+- **Upkeep:**
+  - Bridges or tunnels left with a missing piece get completed.
+  - Dead-end roads, such as the stub left after a house turns, are cleared to recover their
+    tiles.
+- **Shortening built roads**, once nothing is waiting to be connected:
+  - **Shortcuts:** a house whose private road (the stretch only it uses, up to the first
+    junction) is longer than a fresh connection would be gets reconnected, usually just by
+    turning it to face a nearby road. The old road is then cleared.
+  - **Redundant tiles:** loops and doubled connections, such as two roads into the same car
+    park, lose the tiles nobody needs.
+  - **Limits:** neither may cut off a house or destination, or make any house's trip to any
+    destination of its colour more than one or two tiles longer.
+  - **Order:** clears go one tile at a time from the loose end, since each is validated
+    against the map as it is.
 
 ## Usage
 
@@ -73,10 +101,22 @@ unlocks still go to your account.
 - Only plain roads, plus bridges and tunnels as straight crossings. Roundabouts, traffic
   lights and motorways are picked as upgrades but never placed, and the bot doesn't reroute
   congested roads, so busy late-game cities eventually jam and overflow.
+- Houses that are already connected are never turned, even if another side would now be
+  shorter.
 - `--start` only works from the main menu.
 - Injection depends on the App Store build being signed without hardened runtime or library
   validation. A future game update that adds either will stop `DYLD_INSERT_LIBRARIES` from
   working.
+
+## Tests
+
+```bash
+python3 -m unittest discover -s tests
+```
+
+These are planner tests on small hand-built boards: turning a house onto an adjacent road,
+shortcutting a looping private road, dropping a doubled car park connection while keeping a
+loop that's the short way to a second destination, and reclaiming dead ends.
 
 ## Tools
 

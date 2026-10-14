@@ -374,6 +374,54 @@ class Session:
                     raise r
         return codes
 
+    def clear_tiles(self, tiles: list[Pos], sequential: bool = False) -> list[int]:
+        """Remove the roads on tiles with TileEditor.ClearTile (as the eraser does); their road
+        tiles go back to the inventory. Returns a TileEditResultCode per tile.
+
+        Like drawing, each clear is validated against the map as it is, so a chain has to be
+        cleared one tile at a time from its loose end (sequential=True); a tile that doesn't
+        disappear stops the rest, which come back as EDIT_SKIPPED."""
+        if sequential:
+            codes = []
+            for p in tiles:
+                code = self._clear_tiles_now([p])[0]
+                if code == EDIT_SUCCESS and not self._wait_until_clear(p):
+                    code = EDIT_SKIPPED
+                codes.append(code)
+                if code != EDIT_SUCCESS:
+                    break
+            return codes + [EDIT_SKIPPED] * (len(tiles) - len(codes))
+        return self._clear_tiles_now(tiles)
+
+    def _wait_until_clear(self, p: Pos, timeout: float = 3.0) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            roads = self.b.call(self.h["tilemap"], "GetTileModel", _vec(p), then=["_tile", "_twoLaneRoadState", "*"])
+            if not roads or not any(roads):
+                return True
+            time.sleep(0.05)
+        return False
+
+    def _clear_tiles_now(self, tiles: list[Pos]) -> list[int]:
+        h = self.h
+        if not tiles:
+            return []
+        checks = self.b.batch([call_req(h["editor"], "ClearTile", h["tilemap"], _vec(p), 0) for p in tiles])
+        codes, schedule = [], []
+        for result in checks:
+            if isinstance(result, Exception):
+                codes.append(-1)
+                continue
+            codes.append(result["resultCode"])
+            if result["resultCode"] == EDIT_SUCCESS and result["edit"]:
+                command = nested_call(EDIT_TILE_COMMAND, "Create", h["scope"], result["edit"])
+                schedule.append(call_req(h["sim"], "ScheduleCommand", command))
+        if schedule:
+            for r in self.b.batch(schedule):
+                if isinstance(r, Exception):
+                    raise r
+        return codes
+
     def upgrade_choices(self) -> list[dict]:
         """Packages offered by the first pending choice: {type, amount, additionalConcrete}."""
         choices = self.b.get(self.h["upgrades"], ["pendingUpgradeChoices", "#0", "choices", "*"])
