@@ -14,7 +14,7 @@ import itertools
 from dataclasses import dataclass, field, replace
 
 from game import (DIRS, Content, Destination, House, Pos, State, Terrain, Upgrade, direction_between, neighbor,
-                  opposite)
+                  opposite, ring_tiles)
 
 BLOCKING = {Content.HOUSE, Content.DESTINATION, Content.CARPARK, Content.BOAT_TERMINAL}
 
@@ -121,6 +121,10 @@ class Board:
     group: int | None = None  # colour of the road being planned, for the shared-road cost
     # When set, the only existing road tiles a search may step on (for roads that must be all new).
     road_allowed: set[Pos] | None = None
+    rings: list[set[Pos]] = field(init=False, repr=False)  # each roundabout's 4 ring tiles
+
+    def __post_init__(self):
+        self.rings = [set(ring_tiles(c)) for c in self.state.roundabouts]
 
     def is_road(self, p: Pos) -> bool:
         return self.state.has_road(p) or p in self.planned
@@ -179,11 +183,12 @@ class Board:
     def move_allowed(self, p: Pos, d: int) -> bool:
         if (p, d) in self.refused:
             return False
-        # A roundabout keeps the exits it was built with: the game accepts a road drawn into it from
-        # another side but never joins it, which leaves a stub that is cleared and planned again.
+        # A roundabout joins any neighbour whose road is drawn toward its centre, but a road can't be
+        # drawn out of the centre, and two of its ring tiles are already linked by the ring.
         q = neighbor(p, d)
-        if (p in self.state.roundabouts and not self.state.joined(p, d)) or \
-                (q in self.state.roundabouts and not self.state.joined(q, opposite(d))):
+        if p in self.state.roundabouts and not self.state.joined(p, d):
+            return False
+        if any(p in ring and q in ring for ring in self.rings):
             return False
         if d % 2:  # diagonal: may not cross another diagonal at the same corner
             corner = self.corner(p, d)
@@ -479,6 +484,7 @@ def dead_ends(state: State, terrain: dict[Pos, Terrain]) -> list[Pos]:
     road was refused halfway). Clearing them returns their tiles to the inventory.
     Bridges and tunnels, and the tiles next to them, are left alone."""
     keep: set[Pos] = {h.access for h in state.houses} | state.roundabouts | state.traffic_lights
+    keep.update(t for c in state.roundabouts for t in ring_tiles(c))
     for cp in state.carparks.values():
         keep.update(outside for outside, _ in cp.entrances)
     for p, dirs in state.roads.items():
@@ -632,6 +638,7 @@ def _protected(state: State, terrain: dict[Pos, Terrain]) -> set[Pos]:
     traffic lights, bridges/tunnels and the tiles next to them, and anything that isn't plain
     driveable ground."""
     keep: set[Pos] = {h.access for h in state.houses} | state.roundabouts | state.traffic_lights
+    keep.update(t for c in state.roundabouts for t in ring_tiles(c))
     for cp in state.carparks.values():
         keep.update(outside for outside, _ in cp.entrances)
     for p, dirs in state.roads.items():

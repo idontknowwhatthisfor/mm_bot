@@ -93,17 +93,29 @@ def _value(v, default=None):
     return v
 
 
+def ring_tiles(centre: Pos) -> list[Pos]:
+    """The 4 tiles a roundabout's one-way ring runs through: north, east, south and west of its centre."""
+    return [neighbor(centre, d) for d in CARDINALS]
+
+
 def join_roundabouts(roads: dict[Pos, list[int]], roundabouts: set[Pos]):
-    """A roundabout's centre tile keeps its connections in the roundabout, not in its two-lane road
-    state, which reads as empty. Mark it as joined to every neighbour whose road points into it, so
-    networks, routes and dead-end checks see a junction there rather than a gap."""
-    for p in roundabouts:
-        r = list(roads.get(p) or [0] * 8)
+    """Model each roundabout as one junction at its centre. In the game the centre holds no road and
+    the ring runs one way through the 4 tiles around it (`_activeRoundaboutInput/Output`, kept out
+    of `_twoLaneRoadState`), so read raw, the roads around it look cut off from each other. Cars
+    reach the ring from the ring tiles' own roads and from any neighbour whose road points at the
+    centre, diagonal ones included. So the centre is joined both ways to its 4 ring tiles, and to
+    every other neighbour whose road points at it."""
+    for c in roundabouts:
+        r = list(roads.get(c) or [0] * 8)
         for d in range(8):
-            q = roads.get(neighbor(p, d))
-            if q and q[opposite(d)]:
+            q = neighbor(c, d)
+            qr = roads.get(q)
+            if d in CARDINALS or (qr and qr[opposite(d)]):
                 r[d] = r[d] or 8
-        roads[p] = r
+                qr = list(qr or [0] * 8)
+                qr[opposite(d)] = qr[opposite(d)] or 8
+                roads[q] = qr
+        roads[c] = r
 
 
 @dataclass

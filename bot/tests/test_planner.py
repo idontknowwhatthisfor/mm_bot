@@ -289,40 +289,59 @@ class TrafficTests(unittest.TestCase):
         self.assertEqual(codes.count(EDIT_SUCCESS), len(sent))
 
 
-    def test_roundabout_centre_joins_the_roads_into_it(self):
-        # The game keeps a roundabout's connections out of its centre tile's two-lane road state, so
-        # the centre reads as roadless. Without joining it back, the car park beyond it looked cut off
-        # (fed again every tick) and the roads into it looked like dead ends (cleared every tick).
+    def _roundabout(self, diagonal_arms=()):
+        """A roundabout at (5, 9) as the game leaves it on a + junction: the centre has no road, each
+        ring tile keeps only its outward arm, and the ring itself isn't in the road state. Diagonal
+        arms end on a corner tile pointing at the centre, as the game draws them."""
         m = Map()
-        m.destination(*DEST_EAST)
+        dest = m.destination(*DEST_EAST)
         m.link((9, 9), (10, 9))
-        m.road((9, 9), (8, 9), (7, 9), (6, 9))
-        m.house((6, 10), S)
-        m.link((6, 10), (6, 9))
+        c = (5, 9)
+        m.road((9, 9), (8, 9), (7, 9), (6, 9))  # east arm onto the east ring tile
+        m.link((4, 9), (3, 9))  # west arm
+        m.house((5, 11), S)  # north and south arms lead to houses
+        m.link((5, 11), (5, 10))
+        m.house((5, 7), N)
+        m.link((5, 7), (5, 8))
+        for corner in diagonal_arms:
+            m.link(tuple(2 * corner[i] - c[i] for i in range(2)), corner)  # outer tile -> corner
+            m.roads.setdefault(corner, [0] * 8)[direction_between(corner, c)] = 8  # corner -> centre
+        m.house((3, 10), S)
+        m.link((3, 10), (3, 9))
+        return m, dest, c
+
+    def _read(self, m, c):
         st = m.state()
-        st.roads[(8, 9)] = [0] * 8  # the roundabout centre as the game reports it
-        st.roundabouts.add((8, 9))
-        self.assertTrue(unfed_destinations(st, Network(st)))
-        self.assertTrue(dead_ends(st, m.terrain))
+        st.roundabouts.add(c)
         join_roundabouts(st.roads, st.roundabouts)
-        self.assertEqual(st.links((8, 9)), 2)
+        return st
+
+    def test_plus_roundabout_is_one_junction(self):
+        m, dest, c = self._roundabout()
+        raw = m.state()
+        self.assertTrue(unfed_destinations(raw, Network(raw)))  # read raw, the west house is cut off
+        st = self._read(m, c)
+        self.assertEqual(st.links(c), 4)
         self.assertEqual(unfed_destinations(st, Network(st)), [])
         self.assertEqual(dead_ends(st, m.terrain), [])
-        self.assertNotIn((8, 9), redundant_tiles(st, m.terrain))
+        self.assertFalse(set(redundant_tiles(st, m.terrain)) & {c, (6, 9), (4, 9), (5, 10), (5, 8)})
 
-    def test_new_roads_use_only_a_roundabouts_existing_exits(self):
-        m = Map()
-        m.destination(*DEST_EAST)
-        m.link((9, 9), (10, 9))
-        m.road((9, 9), (8, 9), (7, 9))
-        house = m.house((8, 6), S)
-        st = m.state()
-        st.roundabouts.add((8, 9))  # joined east and west only
+    def test_diagonal_arms_into_the_centre_are_joined(self):
+        corners = [(6, 10), (4, 10), (4, 8), (6, 8)]
+        m, dest, c = self._roundabout(corners)
+        st = self._read(m, c)
+        self.assertEqual(st.links(c), 8)
         net = Network(st)
-        plan = plan_house(Board(st, m.terrain), house, net, group_roots(st, net), 0, 0)
-        self.assertNotIn((8, 8), plan.tiles[-1:])  # never ends on the roundabout's free north side
-        self.assertNotEqual(plan.tiles[-1], (8, 9))
+        self.assertEqual({net.find(t) for t in corners}, {net.find(c)})
+        self.assertEqual([st.links(t) for t in corners], [2, 2, 2, 2])  # outer arm and centre
 
+    def test_new_arm_is_drawn_into_the_centre_never_out_of_it(self):
+        m, dest, c = self._roundabout()
+        st = self._read(m, c)
+        board = Board(st, m.terrain)
+        self.assertTrue(board.move_allowed((6, 10), direction_between((6, 10), c)))  # corner -> centre
+        self.assertFalse(board.move_allowed(c, direction_between(c, (6, 10))))  # centre -> unjoined corner
+        self.assertFalse(board.move_allowed((5, 10), direction_between((5, 10), (6, 9))))  # ring -> ring
 
     def test_house_keeps_off_another_colours_road(self):
         # Colour 0's trunk runs along row 9; colour 1's road comes down column 5 and meets it. A new
