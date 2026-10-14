@@ -31,9 +31,9 @@ UPGRADE_VALUE = {
     Upgrade.CONCRETE: 1.0,
     Upgrade.BRIDGE: 0.5,  # raised to WATER_CROSSING_VALUE on maps with water
     Upgrade.TUNNEL: 0.5,  # raised on maps with mountains
-    Upgrade.ROUNDABOUT: 3.0,  # dropped to 0 if the game refuses to place them
+    Upgrade.ROUNDABOUT: 0.0,  # not placed for now: the bot can't yet read the roads around one
     Upgrade.MOTORWAY: 0.0,
-    Upgrade.TRAFFIC_LIGHT: 1.0,  # likewise
+    Upgrade.TRAFFIC_LIGHT: 1.0,  # dropped to 0 if the game refuses to place them
 }
 WATER_CROSSING_VALUE = 8.0
 GIVE_UP_AFTER = 5  # failed attempts before a house is left alone for a while
@@ -53,7 +53,10 @@ BYPASS_MIN_EN_ROUTE = 3  # pins with a car already on the way before slow routes
 # Junctions carrying at least this many houses get a roundabout, then a traffic light.
 ROUNDABOUT_MIN_LOAD = 8
 TRAFFIC_LIGHT_MIN_LOAD = 5
-JUNCTION_UPGRADES = ((Upgrade.ROUNDABOUT, ROUNDABOUT_MIN_LOAD), (Upgrade.TRAFFIC_LIGHT, TRAFFIC_LIGHT_MIN_LOAD))
+# Roundabouts are left out: placing one reshapes the roads on the tiles around it in ways the bot
+# doesn't read yet, so it took those roads for dead ends or cut-off car parks, cleared them and
+# lost destinations. Add (Upgrade.ROUNDABOUT, ROUNDABOUT_MIN_LOAD) back once it can.
+JUNCTION_UPGRADES = ((Upgrade.TRAFFIC_LIGHT, TRAFFIC_LIGHT_MIN_LOAD),)
 # Codes saying a roundabout or traffic light can never go through this way (the call itself failed).
 PLACEMENT_BROKEN = {-1, 1}
 
