@@ -61,6 +61,10 @@ class GameMode(IntEnum):
     EXPERT = 4
 
 
+# RoadState bit of a road being taken down: a cleared bridge or tunnel stays like this until the cars
+# on it have left, then its upgrade goes back into stock. Read as no road.
+MOTHBALLED = 16
+
 EDIT_SUCCESS = 0
 EDIT_ALREADY_EXISTS = 13
 EDIT_SKIPPED = -2  # not attempted because an earlier segment of the same road failed
@@ -172,6 +176,61 @@ class Terrain:
     buildable: bool
 
 
+class CarState(IntEnum):
+    """VehicleModel.BehaviorState."""
+    WAITING = 0  # at home, waiting to be sent to a pin
+    DRIVING_TO_DESTINATION = 1
+    PARKING = 2
+    PARKED = 3
+    DRIVING_HOME = 4
+    REALIGNING_DRIVEWAY = 5
+
+
+class Obstacle(IntEnum):
+    """VehicleModel.Frame.nearestObstacle: what the car is slowing down for."""
+    NONE = 0
+    TARGET = 1  # the end of its path
+    LEADING_VEHICLE = 2  # the car ahead
+    BLOCKING_INTERSECTION = 3  # a junction it may not enter yet
+    HOTSWAPPING_LANE = 4
+
+
+# distanceToLeadingVehicle when nothing is ahead (int.MaxValue + 1 as a Fix64).
+NO_LEADER_GAP = 1e9
+
+
+@dataclass
+class Car:
+    id: int
+    house: Pos | None  # home tile
+    colour: int
+    state: CarState
+    destination: int | None  # Destination.key it was sent to (also set on the way home)
+    tile: Pos | None  # road tile it is on; None in a car park or where its lane maps to no tile
+    in_carpark: bool  # on a car park lane (parking, parked, or pulling out)
+    speed: float
+    obstacle: Obstacle
+    gap: float | None  # distance to the car ahead; None when nothing is ahead
+    path: list[Pos] = field(default_factory=list)  # the route still ahead, as tiles (game-assigned)
+    path_length: float = 0.0
+
+    @property
+    def driving(self) -> bool:
+        return self.state in (CarState.DRIVING_TO_DESTINATION, CarState.DRIVING_HOME)
+
+    def stopped(self, threshold: float) -> bool:
+        return self.speed < threshold
+
+
+@dataclass
+class Traffic:
+    """Every car at one moment (Session.read_cars)."""
+    time: float  # game time of the read
+    cars: list[Car]
+    stopped_threshold: float  # RoadChunkModel.CarStoppedSpeedThreshold
+    read_ms: float = 0.0
+
+
 @dataclass
 class State:
     roads: dict[Pos, list[int]]  # per tile, the RoadState toward each of the 8 directions
@@ -192,6 +251,8 @@ class State:
     playable: frozenset[Pos]  # tiles inside the current (growing) city limits
     roundabouts: set[Pos] = field(default_factory=set)
     traffic_lights: set[Pos] = field(default_factory=set)
+    # Upgrades taken down but not back in stock yet (UpgradeDatabase._mothballedUpgrades), by Upgrade.
+    mothballed: list[int] = field(default_factory=lambda: [0] * 9)
 
     def in_playable(self, p: Pos) -> bool:
         return p in self.playable
@@ -210,6 +271,68 @@ class State:
     def links(self, p: Pos) -> int:
         """Roads actually joined to p."""
         return sum(1 for d in range(8) if self.joined(p, d))
+
+
+def snapshot(state: State, terrain: dict[Pos, Terrain], traffic: Traffic | None = None) -> dict:
+    """The state and terrain (and the latest car read, if any) as plain JSON data, to replay a
+    situation offline (load_snapshot, load_traffic)."""
+    pairs = lambda tiles: [list(p) for p in sorted(tiles)]  # noqa: E731
+    cars = None
+    if traffic is not None:
+        cars = {"time": traffic.time, "threshold": traffic.stopped_threshold,
+                "cars": [[c.id, c.house and list(c.house), c.colour, int(c.state), c.destination,
+                          c.tile and list(c.tile), c.in_carpark, c.speed, int(c.obstacle), c.gap,
+                          [list(t) for t in c.path], c.path_length] for c in traffic.cars]}
+    return {
+        "traffic": cars,
+        "roads": [[*p, *r] for p, r in sorted(state.roads.items()) if any(r)],
+        "content": [[*p, int(c)] for p, c in sorted(state.content.items()) if c],
+        "houses": [[*h.pos, h.group, h.driveway, h.waiting, h.cars] for h in state.houses],
+        # Destination and car park tiles keep their order: the first one is used as the anchor.
+        "destinations": [{**{k: v for k, v in vars(d).items() if k != "tiles"}, "tiles": [list(p) for p in d.tiles]}
+                         for d in state.destinations.values()],
+        "carparks": [{"key": c.key, "tiles": [list(p) for p in c.tiles],
+                      "entrances": [[*p, d] for p, d in c.entrances]} for c in state.carparks.values()],
+        "available": list(state.available),
+        "mothballed": list(state.mothballed),
+        "clock": [state.pending_choices, state.week, state.day, state.hour, state.time, state.expansion_time,
+                  state.paused, state.score, state.ended],
+        "playable": pairs(state.playable),
+        "roundabouts": pairs(state.roundabouts),
+        "traffic_lights": pairs(state.traffic_lights),
+        "terrain": [[*p, t.driveable, t.water, t.mountain, t.buildable] for p, t in sorted(terrain.items())],
+    }
+
+
+def load_snapshot(data: dict) -> tuple[State, dict[Pos, Terrain]]:
+    """The (state, terrain) a snapshot() was made from."""
+    tiles = lambda rows: [tuple(r) for r in rows]  # noqa: E731
+    destinations = {}
+    for d in data["destinations"]:
+        d = dict(d, tiles=tiles(d["tiles"]))
+        destinations[d["key"]] = Destination(**d)
+    carparks = {c["key"]: Carpark(c["key"], tiles(c["tiles"]), [((x, y), d) for x, y, d in c["entrances"]])
+                for c in data["carparks"]}
+    state = State({(r[0], r[1]): list(r[2:]) for r in data["roads"]},
+                  {(x, y): Content(c) for x, y, c in data["content"]},
+                  [House((x, y), g, d, w, c) for x, y, g, d, w, c in data["houses"]],
+                  destinations, carparks, list(data["available"]), *data["clock"],
+                  frozenset(tiles(data["playable"])), set(tiles(data["roundabouts"])),
+                  set(tiles(data["traffic_lights"])), mothballed=list(data.get("mothballed") or [0] * 9))
+    terrain = {(x, y): Terrain(dv, w, m, b) for x, y, dv, w, m, b in data["terrain"]}
+    return state, terrain
+
+
+def load_traffic(data: dict) -> Traffic | None:
+    """The car read saved with a snapshot, if there was one."""
+    t = data.get("traffic")
+    if not t:
+        return None
+    tile = lambda v: tuple(v) if v else None  # noqa: E731
+    cars = [Car(i, tile(h), g, CarState(st), dest, tile(at), bool(cp), speed, Obstacle(obs), gap,
+                [tuple(p) for p in path], length)
+            for i, h, g, st, dest, at, cp, speed, obs, gap, path, length in t["cars"]]
+    return Traffic(t["time"], cars, t["threshold"])
 
 
 class Session:
@@ -333,7 +456,8 @@ class Session:
         h = self.h
         tiles, upgrades, clock, score, ended = self.b.batch([
             {**get_req(h["tilemap"], ["_tiles", "*", self.TILE_PROJECTION]), "handles": False},
-            get_req(h["upgrades"], {"available": "_availableUpgrades.*", "pending": "pendingUpgradeChoices._size"}),
+            get_req(h["upgrades"], {"available": "_availableUpgrades.*", "pending": "pendingUpgradeChoices._size",
+                                    "mothballed": "_mothballedUpgrades.*"}),
             get_req(h["clock"], {"week": "Week", "day": "Day", "hour": "Hour", "time": "Time",
                                  "expansion": "ExpansionTime", "paused": "isPaused"}),
             get_req(h["score"], "Score"),
@@ -350,7 +474,7 @@ class Session:
         carparks: dict[int, Carpark] = {}
         for t in tiles:
             p = (t["x"], t["y"])
-            roads[p] = t["r"] or [0] * 8
+            roads[p] = [v & ~MOTHBALLED for v in t["r"]] if t["r"] else [0] * 8
             content[p] = Content(t["ct"])
             if _value(t.get("ra")):
                 roundabouts.add(p)
@@ -381,7 +505,77 @@ class Session:
         join_roundabouts(roads, roundabouts)
         return State(roads, content, houses, destinations, carparks, upgrades["available"], upgrades["pending"],
                      clock["week"], clock["day"], clock["hour"], clock["time"], clock["expansion"],
-                     bool(clock["paused"]), score, bool(ended), playable, roundabouts, lights)
+                     bool(clock["paused"]), score, bool(ended), playable, roundabouts, lights,
+                     mothballed=list(upgrades.get("mothballed") or [0] * 9))
+
+    CAR_PROJECTION = {
+        "id": "id", "state": "behaviorState", "dest": "destination",
+        "lane": "CurrentFrame.lane", "carpark": "CurrentFrame.lane._isCarparkLane",
+        "speed": "CurrentFrame.speed", "obstacle": "CurrentFrame.nearestObstacle",
+        "gap": "CurrentFrame.distanceToLeadingVehicle", "path": "path.*", "path_length": "pathLength",
+    }
+
+    def read_cars(self) -> Traffic | None:
+        """Every car, in one batched request: each house's ownedVehicles with the car's current
+        frame and its remaining path (VehicleModel.path, the lanes still ahead). A lane has no
+        coordinates, so the same request lists every tile's roadChunk.lanes and lanes are matched
+        to tiles by object address. Diagonal-corner and car park lanes map to no tile: a car on a
+        corner counts as on the tile it drives into, and car park lanes are left out of paths."""
+        if not self.attach():
+            return None
+        h = self.h
+        started = time.perf_counter()
+        tiles, corners, houses, threshold, clock = self.b.batch([
+            {**get_req(h["tilemap"], ["_tiles", "*", {"x": "key.m_X", "y": "key.m_Y",
+                                                       "lanes": "value.roadChunk.lanes.*"}]), "handles": False},
+            {**get_req(h["tilemap"], ["_tileCorners", "*", "value.roadChunk.lanes.*"]), "handles": False},
+            {**get_req(h["tilemap"], ["_tiles", "*", "value._tile.ContentModel", "?HouseModel",
+                                      {"x": "tileModel.Coordinates.m_X", "y": "tileModel.Coordinates.m_Y",
+                                       "g": "GroupIndex", "cars": ["ownedVehicles", "*", self.CAR_PROJECTION]}]),
+             "handles": False},
+            get_req({"$class": "Motorways.Models.RoadChunkModel"}, "CarStoppedSpeedThreshold"),
+            get_req(h["clock"], "Time"),
+        ])
+        read_ms = (time.perf_counter() - started) * 1000
+        for r in (tiles, houses, clock):
+            if isinstance(r, Exception):
+                raise r
+        lane_tile: dict[int, Pos] = {}
+        for t in tiles:
+            for lane in t.get("lanes") or []:
+                if isinstance(lane, dict) and "$p" in lane:
+                    lane_tile[lane["$p"]] = (t["x"], t["y"])
+        corner_lanes = set()
+        for lanes in corners if isinstance(corners, list) else []:
+            corner_lanes.update(lane["$p"] for lane in lanes or [] if isinstance(lane, dict) and "$p" in lane)
+
+        cars = []
+        for house in houses:
+            if not house:
+                continue
+            home = (house["x"], house["y"]) if _value(house.get("x")) is not None else None
+            for c in house.get("cars") or []:
+                path: list[Pos] = []
+                for lane in c.get("path") or []:
+                    t = lane_tile.get(lane["$p"]) if isinstance(lane, dict) else None
+                    if t is not None and (not path or path[-1] != t):
+                        path.append(t)
+                lane = c.get("lane")
+                lane_p = lane.get("$p") if isinstance(lane, dict) else None
+                tile = lane_tile.get(lane_p)
+                if tile is None and lane_p in corner_lanes and path:
+                    tile = path[0]  # on a diagonal corner: count it on the tile it drives into
+                gap = _value(c.get("gap"))
+                dest = c.get("dest")
+                cars.append(Car(
+                    id=_value(c.get("id"), 0), house=home, colour=_value(house.get("g"), -1),
+                    state=CarState(_value(c.get("state"), 0)),
+                    destination=dest.get("$p") if isinstance(dest, dict) and "$p" in dest else None,
+                    tile=tile, in_carpark=bool(_value(c.get("carpark"), False)),
+                    speed=float(_value(c.get("speed"), 0.0)), obstacle=Obstacle(_value(c.get("obstacle"), 0)),
+                    gap=None if gap is None or gap >= NO_LEADER_GAP else float(gap),
+                    path=path, path_length=float(_value(c.get("path_length"), 0.0))))
+        return Traffic(float(clock), cars, float(_value(threshold, 0.001)), read_ms)
 
     def _playable_tiles(self, expansion_time: float) -> frozenset[Pos]:
         """The game's own IsTileInPlayableArea, re-evaluated only when the city limits move."""
@@ -426,12 +620,14 @@ class Session:
             time.sleep(0.05)
         return False
 
-    def _add_roads_now(self, segments: list[tuple[Pos, int]]) -> list[int]:
+    def _edit(self, method: str, args: list[list]) -> list[int]:
+        """Validate edits with TileEditor.<method>(tilemap, *args) in one batch, then schedule the
+        valid ones on the simulation as EditTileCommands, as the game's own tools do. Returns the
+        TileEditResultCode for each (-1 where the call itself failed)."""
         h = self.h
-        if not segments:
+        if not args:
             return []
-        checks = self.b.batch([call_req(h["editor"], "AddRoad", h["tilemap"], _vec(p), d)
-                               for p, d in segments])
+        checks = self.b.batch([call_req(h["editor"], method, h["tilemap"], *a) for a in args])
         codes, schedule = [], []
         for result in checks:
             if isinstance(result, Exception):
@@ -447,21 +643,15 @@ class Session:
                     raise r
         return codes
 
+    def _add_roads_now(self, segments: list[tuple[Pos, int]]) -> list[int]:
+        return self._edit("AddRoad", [[_vec(p), d] for p, d in segments])
+
     def add_junction_upgrade(self, kind: Upgrade, p: Pos) -> int:
         """Put a roundabout or a traffic light on a junction tile, the way the game's own tools do:
         TileEditor.AddRoundabout / AddTrafficLight(ITilemap, Vector2Int) validate it, and the
         resulting edit is scheduled as an EditTileCommand. Returns the TileEditResultCode."""
         method = {Upgrade.ROUNDABOUT: "AddRoundabout", Upgrade.TRAFFIC_LIGHT: "AddTrafficLight"}[kind]
-        h = self.h
-        try:
-            result = self.b.call(h["editor"], method, h["tilemap"], _vec(p))
-        except BridgeError:
-            return -1
-        code = result["resultCode"]
-        if code == EDIT_SUCCESS and result["edit"]:
-            command = nested_call(EDIT_TILE_COMMAND, "Create", h["scope"], result["edit"])
-            self.b.call(h["sim"], "ScheduleCommand", command)
-        return code
+        return self._edit(method, [[_vec(p)]])[0]  # a failed validation call comes back as -1
 
     def clear_tiles(self, tiles: list[Pos], sequential: bool = False) -> list[int]:
         """Remove the roads on tiles with TileEditor.ClearTile (as the eraser does); their road
@@ -492,27 +682,7 @@ class Session:
         return False
 
     def _clear_tiles_now(self, tiles: list[Pos]) -> list[int]:
-        h = self.h
-        if not tiles:
-            return []
-        checks = self.b.batch([call_req(h["editor"], "ClearTile", h["tilemap"], _vec(p), 0) for p in tiles])
-        codes, schedule = [], []
-        for result in checks:
-            if isinstance(result, Exception):
-                codes.append(-1)
-                continue
-            codes.append(result["resultCode"])
-            if result["resultCode"] == EDIT_SUCCESS and result["edit"]:
-                command = nested_call(EDIT_TILE_COMMAND, "Create", h["scope"], result["edit"])
-                schedule.append(call_req(h["sim"], "ScheduleCommand", command))
-        if schedule:
-            for r in self.b.batch(schedule):
-                if isinstance(r, Exception):
-                    raise r
-        return codes
-
-    TIME_SCALE = {"$class": "TimeScale"}
-    TIME_SCALES = ("SingleSlow", "Single", "DoubleSlow", "Double", "ExtraFast")
+        return self._edit("ClearTile", [[_vec(p), 0] for p in tiles])
 
     def game_speed(self) -> float:
         """The game's own speed (the play / fast-forward buttons' TimeScale) times its developer
@@ -522,13 +692,13 @@ class Session:
         return scale * (debug or 1.0)
 
     def set_game_speed(self, speed: float) -> float:
-        """Run the game `speed` times faster: the fastest of the game's own speeds (Game.SetTimeScale
-        takes one of the TimeScale instances, as the fast-forward buttons do) that doesn't overshoot,
-        and the rest through MotorwaysGame.DebugTimescale, the multiplier the developer tools use.
+        """Run the game `speed` times faster. The game's own speed (its TimeScale, set by the play
+        and fast-forward buttons) is left alone; MotorwaysGame._debugTimescale, the multiplier the
+        developer tools use, is set to speed / TimeScale so that the two together give `speed`.
         Returns the speed asked of the game."""
         # TimeScale.FromScale returns Single for any value (it maps nothing), and SetTimeScale with the
-        # ExtraFast instance only reached 2.9x, so leave the TimeScale alone and scale the rest with
-        # _debugTimescale, which measured exactly 4.0x when set to 4.
+        # ExtraFast instance only reached 2.9x, so the TimeScale isn't used; _debugTimescale measured
+        # exactly 4.0x when set to 4.
         scale = self.b.call(self.h["game"], "GetTimeScale", then=["_scale"]) or 1.0
         self.b.set(self.h["game"], "_debugTimescale", float(speed / scale))
         return speed

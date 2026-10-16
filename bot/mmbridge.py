@@ -47,10 +47,6 @@ def nested_call(root, method: str, *args, path=None, sig=None, then=None) -> dic
     return {"$call": spec}
 
 
-def is_handle(value) -> bool:
-    return isinstance(value, dict) and "$h" in value
-
-
 def steps(path) -> list:
     if path is None:
         return []

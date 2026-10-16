@@ -3,18 +3,19 @@
 import pathlib
 import sys
 import unittest
+from dataclasses import replace
+from unittest import mock
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 from bot import Bot  # noqa: E402
 from game import (EDIT_ALREADY_EXISTS, EDIT_SUCCESS, Carpark, Content, Destination, House, State, Terrain,  # noqa: E402
-                  direction_between, join_roundabouts)
-from planner import (Board, Network, RoadGraph, dead_ends, group_roots, junctions_by_load,  # noqa: E402
-                     mixed_tiles, plan_bypass, plan_destination, plan_feeder, plan_house, plan_shortcut, redundant_tiles, route_colours, separation_cut,
+                  E, N, S, Upgrade, W, direction_between, join_roundabouts, neighbor, opposite)
+from planner import (Board, Network, Plan, RoadGraph, apply_plan, dead_ends, group_roots, is_served,  # noqa: E402
+                     reclaimable_crossings,
+                     junctions_by_load, plan_separation, separation_candidates,
+                     mixed_tiles, plan_bypass, plan_destination, plan_feeder, plan_house, plan_shortcut, redundant_tiles, route_colours, separation_cut, trip_routes,
                      route_loads, unfed_destinations)
-
-N, E, S, W = 0, 2, 4, 6
-
 
 class Map:
     """A blank driveable board to place buildings and roads on."""
@@ -95,6 +96,69 @@ class RoadLengthTests(unittest.TestCase):
         self.assertEqual(plan.new_tiles, 0)  # turn to face (5, 10), one link down to the main road
         self.assertTrue(plan.turned_house)
         self.assertEqual(plan.saves, 5)  # the whole loop goes
+
+    def test_shortcut_keeps_off_a_busy_trunk(self):
+        # The house's long private road joins a quiet road (row 5, then up column 9). A shortcut
+        # onto the trunk along row 9 is shortest, but with the trunk busy it joins the quiet road.
+        m = Map()
+        m.destination(*DEST_EAST)
+        m.link((9, 9), (10, 9))
+        m.road(*[(x, 9) for x in range(9, 1, -1)])
+        m.road((9, 9), (9, 8), (9, 7), (9, 6), (9, 5), *[(x, 5) for x in range(8, 2, -1)])
+        m.house((6, 4), N)
+        m.link((6, 4), (6, 5))
+        house = m.house((5, 7), W)
+        m.road((4, 7), (3, 6), (3, 5))
+        m.link((5, 7), (4, 7))
+        st = m.state()
+        graph = RoadGraph(st)
+        trips, _ = graph.evaluate()
+        trunk = {(x, 9) for x in range(2, 9)}
+        quiet = plan_shortcut(st, m.terrain, house, set(), 0, 0, graph, trips)
+        self.assertTrue(set(quiet.tiles) & trunk)  # unloaded, the trunk is the short way
+        busy = plan_shortcut(st, m.terrain, house, set(), 0, 0, graph, trips, {t: 20 for t in trunk}, {})
+        self.assertIsNotNone(busy)
+        self.assertEqual(set(busy.tiles) & trunk, set())
+
+    def test_house_is_joined_to_a_driveway_tile_that_already_has_road(self):
+        # The house faces a tile whose road runs on to the network but doesn't point back at the
+        # house. A plan running on from there must still join the house to that tile.
+        m = Map()
+        m.destination(*DEST_EAST)
+        m.link((9, 9), (10, 9))
+        m.road((5, 9), (6, 9), (7, 9), (8, 9), (9, 9))
+        house = m.house((3, 11), E)
+        m.road((4, 11), (5, 10))  # starts at the house's driveway tile, not linked to the house
+        st = m.state()
+        net = Network(st)
+        plan = plan_house(Board(st, m.terrain), house, net, group_roots(st, net), 0, 0)
+        if not plan.turned_house:
+            self.assertIn(((4, 11), W), plan.segments)
+        after = apply_plan(st, plan)
+        net = Network(after)
+        self.assertTrue(is_served(next(h for h in after.houses if h.pos == (3, 11)), net, group_roots(after, net)))
+
+    def test_plan_with_nothing_left_to_draw_is_left_alone(self):
+        m = Map()
+        m.destination(*DEST_EAST)
+        m.link((9, 9), (10, 9))
+        m.road((7, 9), (8, 9), (9, 9))
+        m.house((6, 9), E)  # a connected house at the end of the road, so it isn't a dead end
+        m.link((6, 9), (7, 9))
+        m.house((3, 11), E)
+        st = m.state()
+        session = FakeSession(m.terrain)
+        bot = Bot(session)
+        stale = Plan("house (3, 11)", ("house", (3, 11)), 0, [((7, 9), E), ((8, 9), E)], [(7, 9), (8, 9)], 0)
+        import bot as bot_module
+        real = bot_module.plan_house
+        bot_module.plan_house = lambda *a, **k: stale
+        try:
+            bot.build(st)
+        finally:
+            bot_module.plan_house = real
+        self.assertEqual(session.drawn, [])
+        self.assertGreater(bot.skip_until[("house", (3, 11))], st.time)
 
     def test_unshared_road_rebuilt_shorter(self):
         plan = self._long_way_round(shared=False)
@@ -343,6 +407,13 @@ class TrafficTests(unittest.TestCase):
         self.assertFalse(board.move_allowed(c, direction_between(c, (6, 10))))  # centre -> unjoined corner
         self.assertFalse(board.move_allowed((5, 10), direction_between((5, 10), (6, 9))))  # ring -> ring
 
+    def test_ring_tiles_get_no_junction_upgrade(self):
+        m, dest, c = self._roundabout()
+        m.link((6, 9), (7, 10))  # a second arm on the east ring tile makes it a 3-way tile
+        st = self._read(m, c)
+        self.assertEqual(st.links((6, 9)), 3)
+        self.assertEqual(junctions_by_load(st, {(6, 9): 20, c: 20}, 1), [])
+
     def test_house_keeps_off_another_colours_road(self):
         # Colour 0's trunk runs along row 9; colour 1's road comes down column 5 and meets it. A new
         # colour 1 house above the trunk takes one new tile straight to its own colour's road.
@@ -428,6 +499,312 @@ class TrafficTests(unittest.TestCase):
         cut = separation_cut(st, m.terrain)
         self.assertEqual(cut[:1], [(4, 10)])
         self.assertNotIn((5, 12), redundant_tiles(st, m.terrain))  # its own road stays
+
+    def test_colours_follow_the_drive_to_every_destination(self):
+        # A colour 2 house with two destinations of its colour: the near one east, the far one west.
+        # Its cars serve both, so it counts on the road west too, not only on the way east.
+        m = Map()
+        m.destination(*DEST_EAST, group=2)
+        m.link((9, 9), (10, 9))
+        m.destination([(0, 10), (1, 10), (0, 11), (1, 11)], [(1, 9), (0, 9)], (2, 9), E, group=2)
+        m.link((2, 9), (1, 9))
+        house = m.house((7, 12), S, group=2)
+        m.road((7, 12), (7, 11), (8, 10), (9, 9))  # 2.8 tiles east
+        m.road((7, 11), (6, 11), (5, 11), (4, 11), (3, 10), (2, 9))  # 5.8 tiles west
+        st = m.state()
+        west = [(6, 11), (5, 11), (4, 11), (3, 10)]
+        nearest = route_colours(st, every_destination=False)
+        every = route_colours(st)
+        self.assertTrue(all(t not in nearest for t in west))
+        self.assertTrue(all(every[t] == {2: 1} for t in west))
+        # Two other colours on the road west make it count against joining this network.
+        shared = {t: {0: 1, 1: 1} for t in west}
+        _, crowded = trip_routes(st, 2, colours=shared)
+        self.assertEqual(crowded[(7, 11)], len(west))
+        self.assertEqual(house.access, (7, 11))
+
+    def test_house_drives_over_its_own_network_to_avoid_a_shared_road(self):
+        # Colour 2's network reaches its car park only along row 9, which colours 0 and 1 use. A
+        # new colour 2 house can only leave onto that network (water all round it otherwise). It
+        # must run on over its own network and build a road of its own to the car park, not just
+        # join the network and drive along row 9 too.
+        m = self._three_colours_on_row_9()
+        for t in [(4, 12), *[(x, 12) for x in range(5, 9)], (9, 11), (9, 10)]:
+            m.roads.pop(t, None)  # take colour 2's own road away
+        m.roads[(4, 11)][direction_between((4, 11), (4, 12))] = 0
+        m.roads[(9, 9)][direction_between((9, 9), (9, 10))] = 0
+        m.road((4, 11), (3, 12), (2, 12))
+        house = m.house((1, 13), direction_between((1, 13), (2, 12)), group=2)
+        for t in [(0, 12), (0, 13), (0, 14), (1, 12), (1, 14), (2, 13), (2, 14)]:
+            m.terrain[t] = WATER
+        st = m.state()
+        colours = route_colours(st)
+        shared = {p for p, c in colours.items() if len({g for g in c if g != 2}) >= 2}
+        self.assertTrue(shared)
+        net = Network(st)
+        plan = plan_house(Board(st, m.terrain, colours=colours), house, net, group_roots(st, net), 0, 0)
+        self.assertIsNotNone(plan)
+        self.assertEqual(set(plan.tiles) & shared, set())
+        self.assertEqual(plan.tiles[-1], (9, 9))  # its own way into the car park
+
+    def test_separate_road_then_cut_takes_a_colour_off_a_shared_road(self):
+        # Colour 2 shares row 9 with colours 0 and 1 and has no road of its own. A separate road is
+        # planned around row 9; once it is drawn, the cut moves colour 2 onto it and no road
+        # carries three colours.
+        m = self._three_colours_on_row_9()
+        for t in [(4, 12), *[(x, 12) for x in range(5, 9)], (9, 11), (9, 10)]:
+            m.roads.pop(t, None)
+        m.roads[(4, 11)][direction_between((4, 11), (4, 12))] = 0
+        m.roads[(9, 9)][direction_between((9, 9), (9, 10))] = 0
+        st = m.state()
+        self.assertTrue(mixed_tiles(st))
+        self.assertEqual(separation_cut(st, m.terrain), [])  # nothing to cut yet: no other way round
+        self.assertIn((3, 11), [h.pos for h in separation_candidates(st)])
+        house = next(h for h in st.houses if h.pos == (3, 11))
+        colours = route_colours(st)
+        plan = plan_separation(Board(st, m.terrain, colours=colours), house, 0, 0)
+        self.assertIsNotNone(plan)
+        shared = {p for p, c in colours.items() if len({g for g in c if g != 2}) >= 2}
+        self.assertEqual(set(plan.tiles) & shared, set())
+        after = apply_plan(st, plan)
+        cut = separation_cut(after, m.terrain)
+        roads = {p: list(r) for p, r in after.roads.items()}
+        for p in cut:
+            roads[p] = [0] * 8
+            for d in range(8):
+                if neighbor(p, d) in roads:
+                    roads[neighbor(p, d)][opposite(d)] = 0
+        final = replace(after, roads=roads)
+        self.assertEqual(mixed_tiles(final), set())
+        _, fed = RoadGraph(final).evaluate()
+        self.assertEqual(len(fed), 3)  # every destination still has its houses
+
+    def test_refused_cut_does_not_hold_up_clearing_loops(self):
+        # The game refuses the cut. Once it is backed off, the loop-clearing pass must run instead
+        # of waiting for a cut that won't be made.
+        m = self._three_colours_on_row_9()
+        st = m.state()
+        session = FakeSession(m.terrain)
+        session.refuse = {(4, 10)}
+        bot = Bot(session)
+        for h in st.houses:
+            bot.skip_until[("shortcut", h.pos)] = float("inf")
+            bot.skip_until[("separate", h.pos)] = float("inf")
+        bot.optimise(st, set(), {}, {})
+        self.assertEqual(session.cleared, [[(4, 10)]])  # tried the cut
+        st.time = 10.0
+        bot.optimise(st, set(), {}, {})
+        self.assertEqual(len(session.cleared), 2)
+        self.assertIn((5, 12), session.cleared[1])  # then cleared the loop
+
+
+WATER = Terrain(False, True, False, False)
+MOUNTAIN = Terrain(False, False, True, False)
+
+
+class FakeSession:
+    """Records what the bot draws and clears; every edit succeeds."""
+
+    def __init__(self, terrain):
+        self.terrain = terrain
+        self.drawn = []  # (segments, sequential) per add_roads call
+        self.cleared = []  # tiles per clear_tiles call
+        self.refuse = set()  # tiles the game won't clear
+
+    def add_roads(self, segments, sequential=False):
+        self.drawn.append((list(segments), sequential))
+        return [EDIT_SUCCESS] * len(segments)
+
+    def clear_tiles(self, tiles, sequential=False):
+        self.cleared.append(list(tiles))
+        return [8 if p in self.refuse else EDIT_SUCCESS for p in tiles]  # 8: CannotClearTile
+
+    def add_junction_upgrade(self, kind, p):
+        return EDIT_SUCCESS
+
+
+class CrossingTests(unittest.TestCase):
+    def test_route_needing_a_bridge_and_a_tunnel_uses_one_of_each(self):
+        # A river at x=4 and a mountain ridge at x=8 run the full height of the board.
+        m = Map()
+        m.destination(*DEST_EAST)
+        m.link((9, 9), (10, 9))
+        for y in range(16):
+            m.terrain[(4, y)] = WATER
+            m.terrain[(8, y)] = MOUNTAIN
+        house = m.house((1, 9), E)
+        st = m.state()
+        net = Network(st)
+        plan = plan_house(Board(st, m.terrain), house, net, group_roots(st, net), 1, 1)
+        self.assertIsNotNone(plan)  # the two stocks are separate: one bridge doesn't use up the tunnel
+        self.assertEqual((plan.bridges, plan.tunnels), (1, 1))
+
+    def test_only_the_crossing_that_is_drawn_claims_tiles(self):
+        # Two colours each need a bridge over the river at x=5..6. Only one crossing is drawn per
+        # tick, so the second must not claim tiles that a third house would then join.
+        m = Map()
+        m.destination(*DEST_EAST, group=0)
+        m.link((9, 9), (10, 9))
+        m.destination([(10, 3), (11, 3), (10, 4), (11, 4)], [(10, 2), (11, 2)], (9, 2), W, group=1)
+        m.link((9, 2), (10, 2))
+        for y in range(16):
+            for x in (5, 6):
+                m.terrain[(x, y)] = WATER
+        m.house((3, 9), E, group=0).waiting = 3
+        m.house((3, 2), E, group=1).waiting = 2
+        m.house((2, 4), E, group=1).waiting = 1  # next to where colour 1's bridge road would start
+        st = m.state()
+        st.available[Upgrade.BRIDGE] = 2
+        session = FakeSession(m.terrain)
+        bot = Bot(session)
+        drawn = []
+        bot.record = lambda state, plan, codes: drawn.append(plan)
+        bot.build(st)
+        self.assertEqual(sum(1 for p in drawn if p.crossings), 1)
+        # Every house the bot drew a road for reaches its colour once everything drawn is built.
+        roads = {p: list(r) for p, r in st.roads.items()}
+        for plan in drawn:
+            for p, d in plan.segments:
+                q = neighbor(p, d)
+                roads.setdefault(p, [0] * 8)[d] = 8
+                roads.setdefault(q, [0] * 8)[opposite(d)] = 8
+        after = replace(st, roads=roads)
+        net = Network(after)
+        roots = group_roots(after, net)
+        for plan in drawn:
+            if plan.key[0] == "house":
+                house = next(h for h in after.houses if h.pos == plan.key[1])
+                self.assertTrue(is_served(house, net, roots), f"{plan.label} joins a road that is never drawn")
+
+
+class ScarceCrossingTests(unittest.TestCase):
+    def _river(self, bridges):
+        # The destination east of a river is fed by a house beside it; another house of its colour
+        # sits west of the river with no road yet.
+        m = Map()
+        m.destination(*DEST_EAST)
+        m.link((9, 9), (10, 9))
+        for y in range(16):
+            for x in (5, 6):
+                m.terrain[(x, y)] = WATER
+        m.house((8, 10), S)
+        m.road((8, 10), (8, 9), (9, 9))
+        m.house((3, 9), E)
+        st = m.state()
+        st.available[Upgrade.BRIDGE] = bridges
+        session = FakeSession(m.terrain)
+        Bot(session).build(st)
+        return [p for segs, _ in session.drawn for p, _ in segs if p[0] < 5]  # anything west of the river
+
+    def test_a_house_road_leaves_the_last_bridge_for_destinations(self):
+        self.assertEqual(self._river(1), [])
+        self.assertTrue(self._river(2))  # with a spare bridge the house is connected
+
+    def test_first_bridge_beats_thirty_concrete_on_a_water_map(self):
+        bot = Bot(FakeSession({}))
+        bot.values[Upgrade.BRIDGE] = 8.0  # as on_new_game sets it on a map with water
+        st = Map().state()
+        bridge = {"type": Upgrade.BRIDGE, "amount": 1, "concrete": 20}
+        concrete = {"type": Upgrade.CONCRETE, "amount": 30, "concrete": 0}
+        for stock in (0, 1):  # below the reserve of two, the bridge wins
+            st.available[Upgrade.BRIDGE] = stock
+            self.assertGreater(bot.upgrade_worth(st, bridge), bot.upgrade_worth(st, concrete))
+        st.available[Upgrade.BRIDGE] = 2
+        self.assertLess(bot.upgrade_worth(st, bridge), bot.upgrade_worth(st, concrete))
+
+
+class ReclaimCrossingTests(unittest.TestCase):
+    """Two rivers, down columns 5-6 (A) and 14-15 (B). A colour 0 house west of A reaches its
+    destination east of A over a bridge on row 9 (and, when `loop`, also over a second bridge on row
+    12). A colour 1 destination west of B has its only house east of B, and no bridge is left."""
+
+    def _map(self, loop=True):
+        m = Map(size=20)
+        for y in range(20):
+            for x in (5, 6, 14, 15):
+                m.terrain[(x, y)] = WATER
+        m.destination(*DEST_EAST)
+        m.link((9, 9), (10, 9))
+        m.house((2, 9), E)
+        m.road((2, 9), (3, 9), (4, 9), (5, 9), (6, 9), (7, 9), (8, 9), (9, 9))
+        if loop:
+            m.road((3, 9), (3, 10), (3, 11), (3, 12), (4, 12), (5, 12), (6, 12), (7, 12), (8, 12), (8, 11),
+                   (8, 10), (8, 9))
+        m.destination([(11, 3), (12, 3), (11, 4), (12, 4)], [(12, 2), (11, 2)], (13, 2), E, group=1)
+        m.house((17, 3), W, group=1)
+        st = m.state()
+        st.available[Upgrade.BRIDGE] = 0
+        return m, st
+
+    def test_the_bridge_nobody_needs_comes_first(self):
+        m, st = self._map()
+        found = reclaimable_crossings(st, m.terrain)
+        self.assertEqual([sorted(deck) for deck, *_ in found], [[(5, 12), (6, 12)], [(5, 9), (6, 9)]])
+        self.assertEqual(found[0][3], 0.0)  # taking down the loop's bridge makes no trip longer
+        self.assertGreater(found[1][3], 0.0)
+
+    def test_stranded_destination_gets_a_bridge_back(self):
+        m, st = self._map()
+        session = FakeSession(m.terrain)
+        Bot(session).build(st)
+        self.assertEqual(session.cleared, [[(5, 12)]])  # one deck tile takes the whole bridge down
+        self.assertEqual(session.drawn, [])  # nothing else is drawn while it comes down
+
+    def test_the_only_bridge_a_house_uses_stays(self):
+        m, st = self._map(loop=False)
+        session = FakeSession(m.terrain)
+        Bot(session).build(st)
+        self.assertEqual(session.cleared, [])
+
+    def test_no_second_bridge_taken_while_one_is_on_its_way_back(self):
+        m, st = self._map()
+        st.mothballed[Upgrade.BRIDGE] = 1
+        session = FakeSession(m.terrain)
+        Bot(session).build(st)
+        decks = {(5, 9), (6, 9), (5, 12), (6, 12)}
+        self.assertFalse([t for tiles in session.cleared for t in tiles if t in decks])  # (loop clearing may run)
+
+
+class CrossingReserveTests(unittest.TestCase):
+    def test_bypass_only_uses_bridges_beyond_the_reserve(self):
+        m = Map()
+        dest = m.destination(*DEST_EAST)
+        m.link((9, 9), (10, 9))
+        m.road(*[(x, 9) for x in range(9, 2, -1)])
+        m.house((3, 10), S)
+        m.link((3, 10), (3, 9))
+        dest.unassigned, dest.en_route = 3, 3  # under pressure, with cars on the way
+        given = []
+
+        def record(board, d, bridges, tunnels):
+            given.append(bridges)
+            return None
+
+        for stock in (2, 3):
+            st = m.state()
+            st.available[Upgrade.BRIDGE] = stock
+            bot = Bot(FakeSession(m.terrain))
+            with mock.patch("bot.plan_bypass", side_effect=record):
+                bot.optimise(st, set(), {}, {})
+        self.assertEqual(given, [0, 1])
+
+
+class SnapshotTests(unittest.TestCase):
+    def test_snapshot_round_trip_replays_the_same_plans(self):
+        import json
+        from game import load_snapshot, snapshot
+        m = TrafficTests()._three_colours_on_row_9()
+        m.terrain[(0, 0)] = WATER
+        st = m.state()
+        st.roundabouts.add((5, 5))
+        again, terrain = load_snapshot(json.loads(json.dumps(snapshot(st, m.terrain))))
+        self.assertEqual(terrain, m.terrain)
+        self.assertEqual(again.houses, st.houses)
+        self.assertEqual(again.destinations, st.destinations)
+        self.assertEqual(again.carparks, st.carparks)
+        self.assertEqual({p: r for p, r in again.roads.items()}, {p: r for p, r in st.roads.items() if any(r)})
+        self.assertEqual(route_colours(again), route_colours(st))
+        self.assertEqual(separation_cut(again, terrain), separation_cut(st, m.terrain))
 
 
 if __name__ == "__main__":

@@ -13,7 +13,14 @@
 
 Each tile has a road state for each of its 8 directions (`roads[p][d]`, a `RoadState`:
 0 none, 2 planned, 4 pending, 8 active, 16 mothballed). **Two tiles are joined only when each points
-at the other** (`State.joined(p, d)`). A house or car park has a stub pointing at its access tile,
+at the other** (`State.joined(p, d)`).
+
+**Mothballed roads are read as gone.** `read()` drops the `MOTHBALLED` (16) bit. Clearing a bridge
+or tunnel deck tile makes a `RemovePassagesEdit`. The game then marks the deck and its approach
+links mothballed and counts the upgrade in `UpgradeDatabase._mothballedUpgrades`
+(`State.mothballed`). Once the cars on it have left (about 8 game seconds when checked live), the
+roads go and the upgrade returns to `_availableUpgrades`. Read as road, a mothballed bridge would
+let plans route over it again while it comes down. A house or car park has a stub pointing at its access tile,
 so it joins the network by the same rule.
 
 `State` helpers:
@@ -36,10 +43,15 @@ so it joins the network by the same rule.
 | `carparks` | `CarparkModel`: tiles and entrances (outside tile + direction) |
 | `roundabouts`, `traffic_lights` | `_isCenterOfRoundabout`, `_hasTrafficLight` |
 | `available` | `UpgradeDatabaseModel._availableUpgrades`, indexed by `Upgrade` |
+| `mothballed` | `UpgradeDatabaseModel._mothballedUpgrades`: taken down, not back in stock yet |
 | `pending_choices` | `pendingUpgradeChoices._size` (an upgrade screen is waiting) |
 | `week, day, hour, time, expansion_time, paused` | `ClockModel` |
 | `score`, `ended` | `ScoreModel.Score`, `Game.HasGameEnded` |
 | `playable` | `City.IsTileInPlayableArea`, re-evaluated only when the limits move |
+
+Cars aren't part of `State`. They're read on their own schedule by `Session.read_cars()` (below).
+`snapshot(state, terrain, traffic)` also saves the latest car read, and `load_traffic(data)` gives it
+back.
 
 `Destination` fields the strategy relies on:
 
@@ -70,6 +82,91 @@ holds no road, and the ring connections live outside `_twoLaneRoadState` (detail
 cut off from each other. `join_roundabouts()` fixes that before the `State` is built: it joins the
 centre both ways to its 4 ring tiles, and to every other neighbour whose road points at the centre
 (diagonal arms included). The planner then sees the roundabout as one junction at its centre.
+
+## Cars: `Session.read_cars()`
+
+`read_cars()` returns a `Traffic` (game time, every `Car`, the stopped-speed threshold, how long the
+read took). It is **one batched request** with `handles=False`:
+
+1. every tile's `roadChunk.lanes` (to map lanes to tiles);
+2. every diagonal corner's lanes (`TilemapModel._tileCorners[*].value.roadChunk.lanes`);
+3. every house's `ownedVehicles`, each projected through `CAR_PROJECTION`;
+4. `RoadChunkModel.CarStoppedSpeedThreshold` (a private static, read from the `$class` root);
+5. the clock.
+
+| `Car` field | Game field | Notes |
+|---|---|---|
+| `id` | `VehicleModel.id` | |
+| `house`, `colour` | the owning house's tile and `GroupIndex` | |
+| `state` | `behaviorState` | `CarState`: 0 waiting at home, 1 driving to a destination, 2 parking, 3 parked, 4 driving home, 5 realigning on the driveway |
+| `destination` | `destination` (`$p`) | the same address as `Destination.key`; also set while driving home |
+| `tile` | `CurrentFrame.lane` mapped to a tile | `None` on a car park lane |
+| `in_carpark` | `CurrentFrame.lane._isCarparkLane` | |
+| `speed` | `CurrentFrame.speed` | world units per game second |
+| `obstacle` | `CurrentFrame.nearestObstacle` | `Obstacle`: 0 none, 1 target, 2 leading vehicle, 3 blocking intersection, 4 hotswapping lane |
+| `gap` | `CurrentFrame.distanceToLeadingVehicle` | `None` when nothing is ahead |
+| `path` | `path` (lanes) mapped to tiles | the route **still ahead** |
+| `path_length` | `pathLength` | world units still to drive |
+
+Unreadable fields fall back to defaults through `_value()`, as in `read()`.
+
+### What the live probes showed
+
+These come from `tools/cars.py` and two probe sessions on Tokyo at weeks 5–8, with 100–110 cars.
+
+- **Worked as the decompile says:**
+  - `ownedVehicles`, `behaviorState`, `destination` and `pathLength`;
+  - all the `CurrentFrame` fields (`CurrentFrame` works for cars as for destinations);
+  - `LaneModel` `SpeedLimit`, `PathfindingCost`, `_isCarparkLane` and `connection`;
+  - `CarStoppedSpeedThreshold`, which reads as 0.001.
+
+  Every driving car's `destination` matched a destination in `State`.
+- **`path` is the route still ahead.** It shrinks as the car drives and starts after the lane the
+  car is on. `LastCommittedLane` is still in `path` (13 of 13 cars checked).
+- **`distanceToLeadingVehicle` is 2147483648 (2³¹) when no car is ahead.** Anything at or above
+  `NO_LEADER_GAP` (1e9) is read as `None`.
+- **Some lanes map to no tile.**
+  - **Car park lanes:** every lane that matched no tile and no corner was a car park lane. That
+    covers cars parking, parked, or pulling out to drive home. They are left out of `path`.
+  - **Diagonal corners:** a corner chunk is keyed by `(tileCoordinate, cornerDirection)`, and that
+    tile can be one of the side tiles, not on the road. Corner lanes are left out of `path`. A car
+    on a corner counts as being on the tile it drives into.
+  - **Roundabouts:** the ring's lanes are on the centre tile.
+  - **Gaps:** a car's `path` can therefore skip tiles, so the route check allows gaps.
+- **Queues:**
+  - With no jam, cars behind a leading vehicle still move: median speed 1.2, median gap 2.4–3.4.
+  - In a real jam they stop completely (below 0.001). The calibration game hit 12 cars stopped at
+    once near game over.
+  - The median driving speed is about 1.2, and the maximum about 2.9.
+- **`RoadChunkModel._laneSpeedLimitScale`** is 1 on every road tile (120 checked), so there is no
+  per-tile slowdown.
+- **Timing of one `read_cars()`:**
+  - 24–39 ms with about 100 cars (357 tiles, 1,048 lanes, 732 of them on corners);
+  - 27–30 ms with 154–194 cars late in a week-10 game.
+
+  The bot reads cars once per game second (`CAR_READ_EVERY`) and checks routes every 5
+  (`ROUTE_CHECK_EVERY`). `traffic.check_routes` takes about 12 ms with 194 cars and 99 houses.
+
+### How the game picks routes
+
+The game routes by travel time:
+
+- **`LaneModel.PathfindingCost` = ⌊10 × length / SpeedLimit⌋** on every lane shape checked.
+- **Lengths:** a tile is **2.0** world units. A straight lane measures 2.0, and a diagonal step is
+  2.0 plus a 0.828 corner lane, i.e. 2√2.
+- **Turning lanes:**
+  - **45° bend:** speed limit 1, length 1.74–2.04, cost 17–20 (a straight tile costs 20);
+  - **90° turn:** speed 0.667, length 1.33–1.86, cost 19–27;
+  - **135° turn:** speed 0.333, cost 15–44;
+  - **u-turn:** speed 0.333, cost 60.
+
+  So apart from u-turns, a turn costs about as much as a straight tile.
+- **Half-speed lanes:** some single straight and 45° lanes have speed limit 0.5, which doubles
+  their cost. What causes it wasn't worked out.
+- **Car parks** with two entrances can be driven through, and the game does route other colours'
+  cars through them. Their lanes are slow: entrance lanes run at 0.5 (cost 24–26), and the lanes
+  past the spaces at 0.167–1 (cost 13–72). The planner models this as `PARK_DRIVE_FACTOR` (see
+  [planner.md](planner.md)).
 
 ## Attaching to a game
 

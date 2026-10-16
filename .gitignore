@@ -9,3 +9,4 @@ bot/.mmbridge_token
 bot.backup-2026-10-14/
 bot.baseline/
 bot/bridge/build/
+bot/logs
