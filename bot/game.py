@@ -757,6 +757,10 @@ class Session:
             time.sleep(0.5)
         raise BridgeError("the main menu never settled; open it and try again")
 
+    def map_label(self) -> str:
+        """The city definition's name, for the log."""
+        return str(self.b.get(self.h["city"], "Definition.@ToString"))
+
     def map_names(self) -> list[str]:
         library = self.b.find_all("Motorways.MapLibrary")[0]
         return self.b.get(library, "_maps.*.mapName")

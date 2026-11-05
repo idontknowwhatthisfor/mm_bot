@@ -11,6 +11,7 @@ cover how the code does it.
 | [game-model.md](game-model.md) | `game.py`: coordinates, the `State` snapshot, how it's read, and every action on the game |
 | [planner.md](planner.md) | `planner.py`: the cost model, the path search, every kind of plan, and the cleanups |
 | [bot-loop.md](bot-loop.md) | `bot.py`: the main loop, the build order, loop guards, upgrades and the log |
+| [sim.md](sim.md) | The offline simulator: what it keeps, what it leaves out, and how to run bots on it |
 | [operations.md](operations.md) | Running, testing, reading logs, tuning constants, and known limitations |
 | [../notes/roundabouts.md](../notes/roundabouts.md) | How the game builds roundabouts, worked out from the game code and live tests |
 

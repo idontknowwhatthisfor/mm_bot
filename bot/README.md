@@ -178,6 +178,19 @@ where a game day takes about 20 seconds.
 `launch.sh` quits a running copy of the game before relaunching it. Opening the game normally,
 from Launchpad or the Dock, starts it without the bridge.
 
+## Simulator
+
+`sim/` is a simplified offline Mini Motorways that the bot plays unchanged. It has rivers and
+bridges, coloured houses and destinations, cars that queue, the overcrowd timer, weekly upgrades and
+growing city limits. No game window is needed, and seeded games are repeatable:
+
+```bash
+python3 -m sim.run --games 10 --map river
+python3 -m sim.view                    # watch a game in a window
+```
+
+See [docs/sim.md](docs/sim.md).
+
 ## Leaderboards
 
 When it attaches to a game, the bot replaces the game's Game Center leaderboard backend with

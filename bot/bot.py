@@ -118,37 +118,47 @@ class Bot:
         self.cars_at: float | None = None  # game time of the last car read
         self.routes_at = float("-inf")  # game time of the last route check
         self.car_read_failed = False
+        self.sleep = time.sleep  # how the bot waits in real time; the simulator makes it a no-op
+        self.snapshot_dir: pathlib.Path | None = SNAPSHOT_DIR  # None: don't save snapshots
 
     def run(self, stop_at_game_end: bool = True):
         log.info("waiting for a game...")
         while True:
             state = self.s.read()
             if state is None:
-                time.sleep(1.0)
+                self.sleep(1.0)
                 continue
-            if self.s.game_key != self.game_key:
-                self.on_new_game(state)
-            if state.ended:
-                log.info("game over: score %d in week %d", state.score, state.week)
-                self.report_destinations(state, "at the end")
-                self.report_traffic()
-                self.save_snapshot(state, "end")
+            score = self.step(state)
+            if score is not None:
                 if stop_at_game_end:
-                    return state.score
-                time.sleep(2.0)
+                    return score
+                self.sleep(2.0)
                 continue
-            self.report(state)
-            self.keep_speed(state)
-            self.watch_traffic(state)
-            if state.pending_choices:
-                self.pick_upgrade(state)
-            else:
-                self.picked_at = None
-                # Only build once the simulation has stepped past our last edits, so nothing
-                # is scheduled twice while the game is paused.
-                if not state.paused and (self.last_build_time is None or state.time > self.last_build_time):
-                    self.build(state)
-            time.sleep(self.tick)
+            self.sleep(self.tick)
+
+    def step(self, state: State) -> int | None:
+        """One look at the game: report, hold the speed, read the cars, then pick an upgrade or
+        build. Returns the score once the game is over, else None. (sim/run.py calls this directly.)"""
+        if self.s.game_key != self.game_key:
+            self.on_new_game(state)
+        if state.ended:
+            log.info("game over: score %d in week %d", state.score, state.week)
+            self.report_destinations(state, "at the end")
+            self.report_traffic()
+            self.save_snapshot(state, "end")
+            return state.score
+        self.report(state)
+        self.keep_speed(state)
+        self.watch_traffic(state)
+        if state.pending_choices:
+            self.pick_upgrade(state)
+        else:
+            self.picked_at = None
+            # Only build once the simulation has stepped past our last edits, so nothing
+            # is scheduled twice while the game is paused.
+            if not state.paused and (self.last_build_time is None or state.time > self.last_build_time):
+                self.build(state)
+        return None
 
     def keep_speed(self, state: State):
         """Hold the game at self.speed. The game may put its own speed back (after a pause or the
@@ -191,7 +201,7 @@ class Bot:
         if mountains:
             self.values[Upgrade.TUNNEL] = WATER_CROSSING_VALUE
         log.info("playing %s (mode %s): %d houses, %d destinations, water=%s mountains=%s",
-                 self.s.b.get(self.s.h["city"], "Definition.@ToString"), self.s.mode.name,
+                 self.s.map_label(), self.s.mode.name,
                  len(state.houses), len(state.destinations), water, mountains)
 
     def report(self, state: State):
@@ -253,11 +263,13 @@ class Bot:
 
     def save_snapshot(self, state: State, event: str):
         """Write the map to logs/ so the situation can be replayed offline (game.load_snapshot)."""
+        if self.snapshot_dir is None:
+            return
         try:
-            SNAPSHOT_DIR.mkdir(exist_ok=True)
-            path = SNAPSHOT_DIR / f"snapshot-{self.started}-week{state.week}-day{state.day}-{event}.json"
+            self.snapshot_dir.mkdir(parents=True, exist_ok=True)
+            path = self.snapshot_dir / f"snapshot-{self.started}-week{state.week}-day{state.day}-{event}.json"
             path.write_text(json.dumps(snapshot(state, self.s.terrain, self.traffic)))
-            log.info("saved the map to %s", path.relative_to(SNAPSHOT_DIR.parent))
+            log.info("saved the map to %s", path)
         except (OSError, TypeError, ValueError) as e:
             log.info("couldn't save the map (%s)", e)
 
@@ -741,7 +753,7 @@ class Bot:
             return
         applied = False
         for _ in range(20):  # the pick lands when the simulation next steps
-            time.sleep(0.25)
+            self.sleep(0.25)
             after = self.s.read()
             if after is None or after.pending_choices < before:
                 applied = True
