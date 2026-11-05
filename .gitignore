@@ -10,3 +10,11 @@ bot.backup-2026-10-14/
 bot.baseline/
 bot/bridge/build/
 bot/logs
+
+# The game itself and code decompiled from it: never commit these
+/decompiled/
+/Frameworks/
+/MacOS/
+/PlugIns/
+/Resources/
+/Info.plist

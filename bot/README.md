@@ -247,4 +247,7 @@ For how the code works in detail, see [docs/](docs/README.md).
 - `tools/board.py` prints the running game as an ASCII map, with each destination's pins and
   supply. It's useful for seeing why a game was lost.
 - `tools/decl.py <Class>` prints a class from the Cpp2IL output in `../decompiled` as bare
-  declarations, useful for finding new fields and methods to read.
+  declarations, useful for finding new fields and methods to read. That folder isn't in the repo,
+  because it's derived from the game. To make it, run [Cpp2IL](https://github.com/SamboyCoding/Cpp2IL)
+  on your own copy of the game with `--output-as diffable-cs --output-to decompiled` from the repo
+  root, so the classes end up in `decompiled/DiffableCs/`.
